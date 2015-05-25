@@ -56,6 +56,11 @@
 #include "canohost.h"
 #include "digest.h"
 
+#ifdef NERSC_MOD
+#include "nersc.h"
+extern int client_session_id;
+#endif
+
 #if OPENSSL_VERSION_NUMBER >= 0x00907000L
 # if defined(HAVE_EVP_SHA256)
 # define evp_ssh_sha256 EVP_sha256
