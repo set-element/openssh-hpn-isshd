@@ -3425,7 +3425,7 @@ channel_setup_fwd_listener_tcpip(int type, struct Forward *fwd,
 #ifdef NERSC_MOD
 	char* t1buf = encode_string(host, strlen(host));
 	s_audit("channel_set_fwd_listener_3", "count=%i count=%i count=%i count=%i uristring=%s port=%i/tcp port=%i/tcp", 
-		lient_session_id, c->self, type, wildcard, t1buf, fwd->connect_port, fwd->listen_port);
+		client_session_id, c->self, type, wildcard, t1buf, fwd->connect_port, fwd->listen_port);
 
 	free(t1buf);
 #endif
