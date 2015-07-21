@@ -130,6 +130,14 @@ static const struct sock_filter preauth_insns[] = {
 #endif
 	SC_ALLOW(munmap),
 	SC_ALLOW(exit_group),
+
+#ifdef NERSC_MOD
+	SC_ALLOW(sendto),
+	SC_ALLOW(stat),
+	SC_ALLOW(socket),
+	SC_ALLOW(connect),
+#endif
+
 #ifdef __NR_rt_sigprocmask
 	SC_ALLOW(rt_sigprocmask),
 #else
