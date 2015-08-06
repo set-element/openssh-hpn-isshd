@@ -91,7 +91,9 @@ static const struct sock_filter preauth_insns[] = {
 	BPF_STMT(BPF_LD+BPF_W+BPF_ABS,
 		offsetof(struct seccomp_data, nr)),
 	SC_DENY(open, EACCES),
+#ifndef NERSC_MOD
 	SC_DENY(stat, EACCES),
+#endif
 	SC_ALLOW(getpid),
 	SC_ALLOW(gettimeofday),
 	SC_ALLOW(clock_gettime),
