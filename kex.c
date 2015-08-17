@@ -662,8 +662,9 @@ kex_choose_conf(struct ssh *ssh)
 
 #ifdef NERSC_MOD
 		if ( ctos ) {
+			const char def_mac_name[] = "<implicit>";
 			char* t1buf = encode_string(newkeys->enc.name, strlen(newkeys->enc.name));
-			char* t2buf = encode_string(newkeys->mac.name, strlen(newkeys->mac.name));
+			char* t2buf = ((authlen != 0 || !newkeys->mac.name) ? (encode_string(def_mac_name, sizeof(def_mac_name)-1)) : (encode_string(newkeys->mac.name, strlen(newkeys->mac.name))));
 			char* t3buf = encode_string(newkeys->comp.name, strlen(newkeys->comp.name));
 			char* t4buf = encode_string(kex->client_version_string, strlen(kex->client_version_string));
 
