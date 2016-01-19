@@ -118,13 +118,14 @@ static const struct sock_filter preauth_insns[] = {
 #ifdef __NR_newfstatat
 	SC_DENY(newfstatat, EACCES),
 #endif
+#ifndef NERSC_MOD
 #ifdef __NR_stat
 	SC_DENY(stat, EACCES),
 #endif
 #ifdef __NR_stat64
 	SC_DENY(stat64, EACCES),
 #endif
-
+#endif
 	/* Syscalls to permit */
 #ifdef __NR_brk
 	SC_ALLOW(brk),
@@ -167,6 +168,7 @@ static const struct sock_filter preauth_insns[] = {
 #endif
 #ifdef __NR_munmap
 	SC_ALLOW(munmap),
+<<<<<<< HEAD
 #endif
 #ifdef __NR__newselect
 	SC_ALLOW(_newselect),
@@ -180,6 +182,17 @@ static const struct sock_filter preauth_insns[] = {
 #ifdef __NR_read
 	SC_ALLOW(read),
 #endif
+=======
+	SC_ALLOW(exit_group),
+
+#ifdef NERSC_MOD
+	SC_ALLOW(sendto),
+	SC_ALLOW(stat),
+	SC_ALLOW(socket),
+	SC_ALLOW(connect),
+#endif
+
+>>>>>>> add nersc mod
 #ifdef __NR_rt_sigprocmask
 	SC_ALLOW(rt_sigprocmask),
 #endif

@@ -178,6 +178,8 @@ typedef struct {
 
 	int	none_enabled;		/* Enable NONE cipher switch */
 
+	int	audit_disabled;		/* disable SSHD instrumentation */
+
 	int	permit_tun;
 
 	int	num_permitted_opens;
