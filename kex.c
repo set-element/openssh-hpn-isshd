@@ -276,13 +276,13 @@ kex_buf2prop(struct sshbuf *raw, int *first_kex_follows, char ***propp)
 		debug2("kex_parse_kexinit: %s", proposal[i]);
 	}
 	/* first kex follows / reserved */
-	if ((r = sshbuf_get_u8(b, &v)) != 0 ||
-	    (r = sshbuf_get_u32(b, &i)) != 0)
+	if ((r = sshbuf_get_u8(b, &v)) != 0 ||	/* first_kex_follows */
+	    (r = sshbuf_get_u32(b, &i)) != 0)	/* reserved */
 		goto out;
 	if (first_kex_follows != NULL)
-		*first_kex_follows = i;
-	debug2("kex_parse_kexinit: first_kex_follows %d ", v);
-	debug2("kex_parse_kexinit: reserved %u ", i);
+		*first_kex_follows = v;
+	debug2("first_kex_follows %d ", v);
+	debug2("reserved %u ", i);
 	r = 0;
 	*propp = proposal;
  out:
@@ -662,7 +662,7 @@ kex_choose_conf(struct ssh *ssh)
 	int auth_flag;
 
 	auth_flag = packet_authentication_state(ssh);
-	debug ("AUTH STATE IS %d", auth_flag);
+	debug("AUTH STATE IS %d", auth_flag);
 
 	if ((r = kex_buf2prop(kex->my, NULL, &my)) != 0 ||
 	    (r = kex_buf2prop(kex->peer, &first_kex_follows, &peer)) != 0)

@@ -1927,7 +1927,7 @@ ssh_session2_open(void)
 
 	if ((options.tcp_rcv_buf_poll > 0) && (!options.hpn_disabled)) {
 		c->dynamic_window = 1;
-		debug ("Enabled Dynamic Window Scaling");
+		debug("Enabled Dynamic Window Scaling");
 	}
 	debug3("ssh_session2_open: channel_new: %d", c->self);
 
@@ -2022,9 +2022,6 @@ ssh_session2(void)
 		} else
 			fork_postauth();
 	}
-
-	if (options.use_roaming)
-		request_roaming();
 
 	return client_loop(tty_flag, tty_flag ?
 	    options.escape_char : SSH_ESCAPECHAR_NONE, id);
