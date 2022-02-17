@@ -274,6 +274,9 @@ static const struct sock_filter preauth_insns[] = {
 #ifdef __NR_connect
 	SC_ALLOW(__NR_connect),
 #endif
+#ifdef __NR_uname
+	SC_ALLOW(__NR_uname),
+#endif
 #endif // NERSC_MOD
 
 #ifdef __NR_rt_sigprocmask

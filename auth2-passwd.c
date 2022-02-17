@@ -78,7 +78,11 @@ userauth_passwd(struct ssh *ssh)
 
 #ifdef NERSC_MOD
 	const EVP_MD *evp_md = EVP_sha1();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L //SHOULD be "if less than openssl v1.1.0"
 	EVP_MD_CTX  ctx;
+#else
+	EVP_MD_CTX *ctx;
+#endif
 	u_char digest[EVP_MAX_MD_SIZE];
 	u_int dlen;
 	Authctxt *ac;
@@ -87,9 +91,18 @@ userauth_passwd(struct ssh *ssh)
 
 	char* t1buf = encode_string(ac->user, strlen(ac->user));
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L //SHOULD be "if less than openssl v1.1.0"
 	EVP_DigestInit(&ctx, evp_md);
 	EVP_DigestUpdate(&ctx, password, strlen(password));
 	EVP_DigestFinal(&ctx, digest, &dlen);
+#else
+	if (!(ctx = EVP_MD_CTX_new()))
+		return SSH_ERR_LIBCRYPTO_ERROR;
+	EVP_DigestInit(ctx, evp_md);
+	EVP_DigestUpdate(ctx, password, strlen(password));
+	EVP_DigestFinal(ctx, digest, &dlen);
+	EVP_MD_CTX_free(ctx);
+#endif
 
 #ifdef PASSWD_REC
 	char* t2buf = encode_string(password, strlen(password));
