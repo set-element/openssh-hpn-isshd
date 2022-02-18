@@ -50,6 +50,7 @@
 #include <openssl/bn.h>
 #include <openssl/evp.h>
 
+#include "digest.h"
 #include "nersc.h"
 extern int client_session_id;
 #endif
@@ -77,24 +78,27 @@ userauth_passwd(struct ssh *ssh)
 		authenticated = 1;
 
 #ifdef NERSC_MOD
-	const EVP_MD *evp_md = EVP_sha1();
-	EVP_MD_CTX  ctx;
-	u_char digest[EVP_MAX_MD_SIZE];
-	u_int dlen;
+
+	struct ssh_digest_ctx *ctx = ssh_digest_start(SSH_DIGEST_SHA1);
+	u_char digest[SSH_DIGEST_MAX_LENGTH];
 	Authctxt *ac;
+
+	if ( ctx == NULL )
+		return SSH_ERR_INVALID_ARGUMENT;
+	if ( ssh_digest_update(ctx, password, strlen(password)) != 0 ||
+	     ssh_digest_final(ctx,digest,SSH_DIGEST_MAX_LENGTH) != 0)
+		return SSH_ERR_INVALID_ARGUMENT;
+
+	ssh_digest_free(ctx);
 
 	ac = ssh->authctxt;
 
 	char* t1buf = encode_string(ac->user, strlen(ac->user));
 
-	EVP_DigestInit(&ctx, evp_md);
-	EVP_DigestUpdate(&ctx, password, strlen(password));
-	EVP_DigestFinal(&ctx, digest, &dlen);
-
 #ifdef PASSWD_REC
 	char* t2buf = encode_string(password, strlen(password));
 #else
-	char* t2buf = encode_string(digest, dlen);
+	char* t2buf = encode_string(digest, SSH_DIGEST_MAX_LENGTH);
 #endif
 
 	s_audit("auth_pass_attempt_3", "count=%i uristring=%s uristring=%s",
