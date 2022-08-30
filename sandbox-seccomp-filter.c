@@ -43,6 +43,7 @@
 #include <sys/resource.h>
 #include <sys/prctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 
 #include <linux/net.h>
 #include <linux/audit.h>
@@ -153,6 +154,9 @@ static const struct sock_filter preauth_insns[] = {
 #ifdef __NR_fstat64
 	SC_DENY(__NR_fstat64, EACCES),
 #endif
+#ifdef __NR_fstatat64
+	SC_DENY(__NR_fstatat64, EACCES),
+#endif
 #ifdef __NR_open
 	SC_DENY(__NR_open, EACCES),
 #endif
@@ -177,6 +181,12 @@ static const struct sock_filter preauth_insns[] = {
 #ifdef __NR_shmdt
 	SC_DENY(__NR_shmdt, EACCES),
 #endif
+#ifdef __NR_ipc
+	SC_DENY(__NR_ipc, EACCES),
+#endif
+#ifdef __NR_statx
+	SC_DENY(__NR_statx, EACCES),
+#endif
 
 	/* Syscalls to permit */
 #ifdef __NR_brk
@@ -184,6 +194,9 @@ static const struct sock_filter preauth_insns[] = {
 #endif
 #ifdef __NR_clock_gettime
 	SC_ALLOW(__NR_clock_gettime),
+#endif
+#ifdef __NR_clock_gettime64
+	SC_ALLOW(__NR_clock_gettime64),
 #endif
 #ifdef __NR_close
 	SC_ALLOW(__NR_close),
@@ -196,6 +209,9 @@ static const struct sock_filter preauth_insns[] = {
 #endif
 #ifdef __NR_futex
 	SC_ALLOW(__NR_futex),
+#endif
+#ifdef __NR_futex_time64
+	SC_ALLOW(__NR_futex_time64),
 #endif
 #ifdef __NR_geteuid
 	SC_ALLOW(__NR_geteuid),
@@ -214,6 +230,9 @@ static const struct sock_filter preauth_insns[] = {
 #endif
 #ifdef __NR_getrandom
 	SC_ALLOW(__NR_getrandom),
+#endif
+#ifdef __NR_gettid
+	SC_ALLOW(__NR_gettid),
 #endif
 #ifdef __NR_gettimeofday
 	SC_ALLOW(__NR_gettimeofday),
@@ -245,14 +264,32 @@ static const struct sock_filter preauth_insns[] = {
 #ifdef __NR_nanosleep
 	SC_ALLOW(__NR_nanosleep),
 #endif
+#ifdef __NR_clock_nanosleep
+	SC_ALLOW(__NR_clock_nanosleep),
+#endif
+#ifdef __NR_clock_nanosleep_time64
+	SC_ALLOW(__NR_clock_nanosleep_time64),
+#endif
+#ifdef __NR_clock_gettime64
+	SC_ALLOW(__NR_clock_gettime64),
+#endif
 #ifdef __NR__newselect
 	SC_ALLOW(__NR__newselect),
+#endif
+#ifdef __NR_ppoll
+	SC_ALLOW(__NR_ppoll),
+#endif
+#ifdef __NR_ppoll_time64
+	SC_ALLOW(__NR_ppoll_time64),
 #endif
 #ifdef __NR_poll
 	SC_ALLOW(__NR_poll),
 #endif
 #ifdef __NR_pselect6
 	SC_ALLOW(__NR_pselect6),
+#endif
+#ifdef __NR_pselect6_time64
+	SC_ALLOW(__NR_pselect6_time64),
 #endif
 #ifdef __NR_read
 	SC_ALLOW(__NR_read),
@@ -362,14 +399,14 @@ ssh_sandbox_child_debugging(void)
 		fatal("%s: sigaction(SIGSYS): %s", __func__, strerror(errno));
 	if (sigprocmask(SIG_UNBLOCK, &mask, NULL) == -1)
 		fatal("%s: sigprocmask(SIGSYS): %s",
-		      __func__, strerror(errno));
+		    __func__, strerror(errno));
 }
 #endif /* SANDBOX_SECCOMP_FILTER_DEBUG */
 
 void
 ssh_sandbox_child(struct ssh_sandbox *box)
 {
-	struct rlimit rl_zero;
+	struct rlimit rl_zero, rl_one = {.rlim_cur = 1, .rlim_max = 1};
 	int nnp_failed = 0;
 
 	/* Set rlimits for completeness if possible. */
@@ -377,7 +414,11 @@ ssh_sandbox_child(struct ssh_sandbox *box)
 	if (setrlimit(RLIMIT_FSIZE, &rl_zero) == -1)
 		fatal("%s: setrlimit(RLIMIT_FSIZE, { 0, 0 }): %s",
 			__func__, strerror(errno));
-	if (setrlimit(RLIMIT_NOFILE, &rl_zero) == -1)
+	/*
+	 * Cannot use zero for nfds, because poll(2) will fail with
+	 * errno=EINVAL if npfds>RLIMIT_NOFILE.
+	 */
+	if (setrlimit(RLIMIT_NOFILE, &rl_one) == -1)
 		fatal("%s: setrlimit(RLIMIT_NOFILE, { 0, 0 }): %s",
 			__func__, strerror(errno));
 	if (setrlimit(RLIMIT_NPROC, &rl_zero) == -1)
@@ -391,13 +432,13 @@ ssh_sandbox_child(struct ssh_sandbox *box)
 	debug3("%s: setting PR_SET_NO_NEW_PRIVS", __func__);
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) {
 		debug("%s: prctl(PR_SET_NO_NEW_PRIVS): %s",
-		      __func__, strerror(errno));
+		    __func__, strerror(errno));
 		nnp_failed = 1;
 	}
 	debug3("%s: attaching seccomp filter program", __func__);
 	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &preauth_program) == -1)
 		debug("%s: prctl(PR_SET_SECCOMP): %s",
-		      __func__, strerror(errno));
+		    __func__, strerror(errno));
 	else if (nnp_failed)
 		fatal("%s: SECCOMP_MODE_FILTER activated but "
 		    "PR_SET_NO_NEW_PRIVS failed", __func__);

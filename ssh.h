@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh.h,v 1.89 2018/12/27 03:25:25 djm Exp $ */
+/* $OpenBSD: ssh.h,v 1.90 2020/07/14 23:57:01 djm Exp $ */
 
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
@@ -17,6 +17,7 @@
 
 /* Default port number. */
 #define SSH_DEFAULT_PORT	22
+#define HPNSSH_DEFAULT_PORT    2222
 
 /*
  * Maximum number of certificate files that can be specified
@@ -48,7 +49,7 @@
  * Name for the service.  The port named by this service overrides the
  * default port if present.
  */
-#define SSH_SERVICE_NAME	"ssh"
+#define SSH_SERVICE_NAME	"hpnssh"
 
 /*
  * Name of the environment variable containing the process ID of the
@@ -66,6 +67,11 @@
  * Environment variable for overwriting the default location of askpass
  */
 #define SSH_ASKPASS_ENV		"SSH_ASKPASS"
+
+/*
+ * Environment variable to control whether or not askpass is used.
+ */
+#define SSH_ASKPASS_REQUIRE_ENV		"SSH_ASKPASS_REQUIRE"
 
 /*
  * Force host key length and server key length to differ by at least this
@@ -88,7 +94,7 @@
  * primary group.
  */
 #ifndef SSH_PRIVSEP_USER
-#define SSH_PRIVSEP_USER		"sshd"
+#define SSH_PRIVSEP_USER		"hpnsshd"
 #endif
 
 /* Listen backlog for sshd, ssh-agent and forwarding sockets */
