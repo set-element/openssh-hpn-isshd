@@ -1,4 +1,4 @@
-/* $OpenBSD: kexgexs.c,v 1.42 2019/01/23 00:30:41 djm Exp $ */
+/* $OpenBSD: kexgexs.c,v 1.45 2023/03/05 05:34:09 dtucker Exp $ */
 /*
  * Copyright (c) 2000 Niels Provos.  All rights reserved.
  * Copyright (c) 2001 Markus Friedl.  All rights reserved.
@@ -46,7 +46,6 @@
 #include "packet.h"
 #include "dh.h"
 #include "ssh2.h"
-#include "compat.h"
 #ifdef GSSAPI
 #include "ssh-gss.h"
 #endif
@@ -77,6 +76,8 @@ input_kex_dh_gex_request(int type, u_int32_t seq, struct ssh *ssh)
 	const BIGNUM *dh_p, *dh_g;
 
 	debug("SSH2_MSG_KEX_DH_GEX_REQUEST received");
+	ssh_dispatch_set(ssh, SSH2_MSG_KEX_DH_GEX_REQUEST, &kex_protocol_error);
+
 	if ((r = sshpkt_get_u32(ssh, &min)) != 0 ||
 	    (r = sshpkt_get_u32(ssh, &nbits)) != 0 ||
 	    (r = sshpkt_get_u32(ssh, &max)) != 0 ||
@@ -136,6 +137,9 @@ input_kex_dh_gex_init(int type, u_int32_t seq, struct ssh *ssh)
 	size_t slen, hashlen;
 	int r;
 
+	debug("SSH2_MSG_KEX_DH_GEX_INIT received");
+	ssh_dispatch_set(ssh, SSH2_MSG_KEX_DH_GEX_INIT, &kex_protocol_error);
+
 	if ((r = kex_load_hostkey(ssh, &server_host_private,
 	    &server_host_public)) != 0)
 		goto out;
@@ -189,8 +193,16 @@ input_kex_dh_gex_init(int type, u_int32_t seq, struct ssh *ssh)
 	    (r = sshpkt_send(ssh)) != 0)
 		goto out;
 
-	if ((r = kex_derive_keys(ssh, hash, hashlen, shared_secret)) == 0)
-		r = kex_send_newkeys(ssh);
+	if ((r = kex_derive_keys(ssh, hash, hashlen, shared_secret)) != 0 ||
+	    (r = kex_send_newkeys(ssh)) != 0)
+		goto out;
+
+	/* retain copy of hostkey used at initial KEX */
+	if (kex->initial_hostkey == NULL &&
+	    (r = sshkey_from_private(server_host_public,
+	    &kex->initial_hostkey)) != 0)
+		goto out;
+	/* success */
  out:
 	explicit_bzero(hash, sizeof(hash));
 	DH_free(kex->dh);

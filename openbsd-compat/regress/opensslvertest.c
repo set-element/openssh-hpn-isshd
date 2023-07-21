@@ -14,6 +14,8 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include "includes.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -54,6 +56,7 @@ fail(long hver, long lver, int result)
 int
 main(void)
 {
+#ifdef WITH_OPENSSL
 	unsigned int i;
 	int res;
 	long hver, lver;
@@ -65,5 +68,6 @@ main(void)
 		if (ssh_compatible_openssl(hver, lver) != res)
 			fail(hver, lver, res);
 	}
+#endif
 	exit(0);
 }

@@ -1,4 +1,4 @@
-/* $OpenBSD: umac.c,v 1.17 2018/04/10 00:10:49 djm Exp $ */
+/* $OpenBSD: umac.c,v 1.23 2023/03/07 01:30:52 djm Exp $ */
 /* -----------------------------------------------------------------------
  *
  * umac.c -- C Implementation UMAC Message Authentication
@@ -39,7 +39,7 @@
   * at http://www.esat.kuleuven.ac.be/~rijmen/rijndael/ (search for
   * "Barreto"). The only two files needed are rijndael-alg-fst.c and
   * rijndael-alg-fst.h. Brian Gladman's version is distributed with the GNU
-  * Public lisence at http://fp.gladman.plus.com/AES/index.htm. It
+  * Public license at http://fp.gladman.plus.com/AES/index.htm. It
   * includes a fast IA-32 assembly version. The OpenSSL crypo library is
   * the third.
   *
@@ -74,6 +74,7 @@
 #include "includes.h"
 #include <sys/types.h>
 #include <string.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -133,15 +134,48 @@ typedef unsigned int	UWORD;  /* Register */
 /* --- Endian Conversion --- Forcing assembly on some platforms           */
 /* ---------------------------------------------------------------------- */
 
+
+/* Using local statically defined versions of the get/put functions
+ * found in misc.c allows them to be inlined. This improves throughput
+ * performance by 10% to 15% on well connected (10Gb/s+) systems. 
+ * Chris Rapier <rapier@psc.edu> 2022-03-09 */
+
+static  __attribute__((__bounded__(__minbytes__, 1, 4)))
+u_int32_t umac_get_u32_le(const void *vp)
+{
+        const u_char *p = (const u_char *)vp;
+        u_int32_t v;
+
+        v  = (u_int32_t)p[0];
+        v |= (u_int32_t)p[1] << 8;
+        v |= (u_int32_t)p[2] << 16;
+        v |= (u_int32_t)p[3] << 24;
+
+        return (v);
+}
+
+#if (! __LITTLE_ENDIAN__) /* compile time warning thrown otherwise */
+static __attribute__((__bounded__(__minbytes__, 1, 4)));
+void umac_put_u32_le(void *vp, u_int32_t v)
+{
+        u_char *p = (u_char *)vp;
+
+        p[0] = (u_char)v & 0xff;
+        p[1] = (u_char)(v >> 8) & 0xff;
+        p[2] = (u_char)(v >> 16) & 0xff;
+        p[3] = (u_char)(v >> 24) & 0xff;
+}
+#endif
+
 #if (__LITTLE_ENDIAN__)
 #define LOAD_UINT32_REVERSED(p)		get_u32(p)
 #define STORE_UINT32_REVERSED(p,v)	put_u32(p,v)
 #else
-#define LOAD_UINT32_REVERSED(p)		get_u32_le(p)
-#define STORE_UINT32_REVERSED(p,v)	put_u32_le(p,v)
+#define LOAD_UINT32_REVERSED(p)		umac_get_u32_le(p)
+#define STORE_UINT32_REVERSED(p,v)	umac_put_u32_le(p,v)
 #endif
 
-#define LOAD_UINT32_LITTLE(p)		(get_u32_le(p))
+#define LOAD_UINT32_LITTLE(p)		(umac_get_u32_le(p))
 #define STORE_UINT32_BIG(p,v)		put_u32(p, v)
 
 /* ---------------------------------------------------------------------- */
@@ -232,7 +266,8 @@ static void pdf_init(pdf_ctx *pc, aes_int_key prf_key)
     explicit_bzero(buf, sizeof(buf));
 }
 
-static void pdf_gen_xor(pdf_ctx *pc, const UINT8 nonce[8], UINT8 buf[8])
+static void pdf_gen_xor(pdf_ctx *pc, const UINT8 nonce[8],
+    UINT8 buf[UMAC_OUTPUT_LEN])
 {
     /* 'ndx' indicates that we'll be using the 0th or 1st eight bytes
      * of the AES output. If last time around we returned the ndx-1st
@@ -289,7 +324,7 @@ static void pdf_gen_xor(pdf_ctx *pc, const UINT8 nonce[8], UINT8 buf[8])
  * versions, one expects the entire message being hashed to be passed
  * in a single buffer and returns the hash result immediately. The second
  * allows the message to be passed in a sequence of buffers. In the
- * muliple-buffer interface, the client calls the routine nh_update() as
+ * multiple-buffer interface, the client calls the routine nh_update() as
  * many times as necessary. When there is no more data to be fed to the
  * hash, the client calls nh_final() which calculates the hash output.
  * Before beginning another hash calculation the nh_reset() routine
@@ -1176,7 +1211,7 @@ static int uhash(uhash_ctx_t ahc, u_char *msg, long len, u_char *res)
 /* The UMAC interface has two interfaces, an all-at-once interface where
  * the entire message to be authenticated is passed to UMAC in one buffer,
  * and a sequential interface where the message is presented a little at a
- * time. The all-at-once is more optimaized than the sequential version and
+ * time. The all-at-once is more optimized than the sequential version and
  * should be preferred when the sequential interface is not required.
  */
 struct umac_ctx {
@@ -1204,8 +1239,7 @@ int umac_delete(struct umac_ctx *ctx)
     if (ctx) {
         if (ALLOC_BOUNDARY)
             ctx = (struct umac_ctx *)ctx->free_ptr;
-        explicit_bzero(ctx, sizeof(*ctx) + ALLOC_BOUNDARY);
-        free(ctx);
+        freezero(ctx, sizeof(*ctx) + ALLOC_BOUNDARY);
     }
     return (1);
 }

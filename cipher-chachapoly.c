@@ -14,9 +14,14 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-/* $OpenBSD: cipher-chachapoly.c,v 1.8 2016/08/03 05:41:57 djm Exp $ */
+/* $OpenBSD: cipher-chachapoly.c,v 1.9 2020/04/03 04:27:03 djm Exp $ */
 
 #include "includes.h"
+#ifdef WITH_OPENSSL
+#include "openbsd-compat/openssl-compat.h"
+#endif
+
+#if !defined(HAVE_EVP_CHACHA20) || defined(HAVE_BROKEN_CHACHA20)
 
 #include <sys/types.h>
 #include <stdarg.h> /* needed for log.h */
@@ -28,15 +33,28 @@
 #include "ssherr.h"
 #include "cipher-chachapoly.h"
 
-int
-chachapoly_init(struct chachapoly_ctx *ctx,
-    const u_char *key, u_int keylen)
+struct chachapoly_ctx {
+	struct chacha_ctx main_ctx, header_ctx;
+};
+
+struct chachapoly_ctx *
+chachapoly_new(const u_char *key, u_int keylen)
 {
+	struct chachapoly_ctx *ctx;
+
 	if (keylen != (32 + 32)) /* 2 x 256 bit keys */
-		return SSH_ERR_INVALID_ARGUMENT;
+		return NULL;
+	if ((ctx = calloc(1, sizeof(*ctx))) == NULL)
+		return NULL;
 	chacha_keysetup(&ctx->main_ctx, key, 256);
 	chacha_keysetup(&ctx->header_ctx, key + 32, 256);
-	return 0;
+	return ctx;
+}
+
+void
+chachapoly_free(struct chachapoly_ctx *cpctx)
+{
+	freezero(cpctx, sizeof(*cpctx));
 }
 
 /*
@@ -71,7 +89,7 @@ chachapoly_crypt(struct chachapoly_ctx *ctx, u_int seqnr, u_char *dest,
 	if (!do_encrypt) {
 		const u_char *tag = src + aadlen + len;
 
-		poly1305_auth(expected_tag, src, aadlen + len, poly_key);
+		poly1305_auth(NULL, expected_tag, src, aadlen + len, poly_key);
 		if (timingsafe_bcmp(expected_tag, tag, POLY1305_TAGLEN) != 0) {
 			r = SSH_ERR_MAC_INVALID;
 			goto out;
@@ -91,7 +109,7 @@ chachapoly_crypt(struct chachapoly_ctx *ctx, u_int seqnr, u_char *dest,
 
 	/* If encrypting, calculate and append tag */
 	if (do_encrypt) {
-		poly1305_auth(dest + aadlen + len, dest, aadlen + len,
+		poly1305_auth(NULL, dest + aadlen + len, dest, aadlen + len,
 		    poly_key);
 	}
 	r = 0;
@@ -117,3 +135,5 @@ chachapoly_get_length(struct chachapoly_ctx *ctx,
 	*plenp = PEEK_U32(buf);
 	return 0;
 }
+
+#endif /* !defined(HAVE_EVP_CHACHA20) || defined(HAVE_BROKEN_CHACHA20) */

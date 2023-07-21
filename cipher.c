@@ -1,4 +1,4 @@
-/* $OpenBSD: cipher.c,v 1.113 2019/09/06 05:23:55 djm Exp $ */
+/* $OpenBSD: cipher.c,v 1.119 2021/04/03 06:18:40 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -52,18 +52,27 @@
 
 #include "openbsd-compat/openssl-compat.h"
 
-#ifndef WITH_OPENSSL
-#define EVP_CIPHER_CTX void
+/* for provider functions */
+#if OPENSSL_VERSION_NUMBER >= 0x30000000UL
+#include <openssl/err.h>
+#include <openssl/params.h>
+#include <openssl/provider.h>
 #endif
 
+#ifndef WITH_OPENSSL
+#define EVP_CIPHER_CTX void
+#define EVP_CIPHER void
+#else
 /* for multi-threaded aes-ctr cipher */
 extern const EVP_CIPHER *evp_aes_ctr_mt(void);
+#endif
 
 struct sshcipher_ctx {
 	int	plaintext;
 	int	encrypt;
 	EVP_CIPHER_CTX *evp;
-	struct chachapoly_ctx cp_ctx; /* XXX union with evp? */
+	const EVP_CIPHER *meth_ptr; /*used to free memory in aes_ctr_mt */
+	struct chachapoly_ctx *cp_ctx;
 	struct aesctr_ctx ac_ctx; /* XXX union with evp? */
 	const struct sshcipher *cipher;
 };
@@ -95,18 +104,13 @@ static struct sshcipher ciphers[] = {
 	{ "aes128-cbc",		16, 16, 0, 0, CFLAG_CBC, EVP_aes_128_cbc },
 	{ "aes192-cbc",		16, 24, 0, 0, CFLAG_CBC, EVP_aes_192_cbc },
 	{ "aes256-cbc",		16, 32, 0, 0, CFLAG_CBC, EVP_aes_256_cbc },
-	{ "rijndael-cbc@lysator.liu.se",
-				16, 32, 0, 0, CFLAG_CBC, EVP_aes_256_cbc },
 	{ "aes128-ctr",		16, 16, 0, 0, 0, EVP_aes_128_ctr },
 	{ "aes192-ctr",		16, 24, 0, 0, 0, EVP_aes_192_ctr },
-	{ "aes256-ctr",		16, 32, 0, 0, 0, EVP_aes_256_ctr }, 
-
-# ifdef OPENSSL_HAVE_EVPGCM
+	{ "aes256-ctr",		16, 32, 0, 0, 0, EVP_aes_256_ctr },
 	{ "aes128-gcm@openssh.com",
 				16, 16, 12, 16, 0, EVP_aes_128_gcm },
 	{ "aes256-gcm@openssh.com",
 				16, 32, 12, 16, 0, EVP_aes_256_gcm },
-# endif /* OPENSSL_HAVE_EVPGCM */
 #else
 	{ "aes128-ctr",		16, 16, 0, 0, CFLAG_AESCTR, NULL },
 	{ "aes192-ctr",		16, 24, 0, 0, CFLAG_AESCTR, NULL },
@@ -114,9 +118,9 @@ static struct sshcipher ciphers[] = {
 #endif
 	{ "chacha20-poly1305@openssh.com",
 				8, 64, 0, 16, CFLAG_CHACHAPOLY, NULL },
-	{ "none",		8, 0, 0, 0, CFLAG_NONE, NULL },
+	{ "none",               8, 0, 0, 0, CFLAG_NONE, NULL },
 
-	{ NULL,			0, 0, 0, 0, 0, NULL }
+	{ NULL,                 0, 0, 0, 0, 0, NULL }
 };
 
 /*--*/
@@ -148,6 +152,17 @@ cipher_alg_list(char sep, int auth_only)
 	return ret;
 }
 
+const char *
+compression_alg_list(int compression)
+{
+#ifdef WITH_ZLIB
+	return compression ? "zlib@openssh.com,zlib,none" :
+	    "none,zlib@openssh.com,zlib";
+#else
+	return "none";
+#endif
+}
+
 /* used to get the cipher name so when force rekeying to handle the
  * single to multithreaded ctr cipher swap we only rekey when appropriate
  */
@@ -157,24 +172,51 @@ cipher_ctx_name(const struct sshcipher_ctx *cc)
 	return cc->cipher->name;
 }
 
-/* in order to get around sandbox and forking issues with a threaded cipher
- * we set the initial pre-auth aes-ctr cipher to the default OpenSSH cipher
- * post auth we set them to the new evp as defined by cipher-ctr-mt
- */
-#ifdef WITH_OPENSSL
-void
-cipher_reset_multithreaded(void)
-{
-	cipher_by_name("aes128-ctr")->evptype = evp_aes_ctr_mt;
-	cipher_by_name("aes192-ctr")->evptype = evp_aes_ctr_mt;
-	cipher_by_name("aes256-ctr")->evptype = evp_aes_ctr_mt;
-}
-#endif
-
 u_int
 cipher_blocksize(const struct sshcipher *c)
 {
 	return (c->block_size);
+}
+
+uint64_t
+cipher_rekey_blocks(const struct sshcipher *c)
+{
+	/*
+	 * Chacha20-Poly1305 does not benefit from data-based rekeying,
+	 * per "The Security of ChaCha20-Poly1305 in the Multi-user Setting",
+	 * Degabriele, J. P., Govinden, J, Gunther, F. and Paterson K.
+	 * ACM CCS 2021; https://eprint.iacr.org/2023/085.pdf
+	 *
+	 * Cryptanalysis aside, we do still want do need to prevent the SSH
+	 * sequence number wrapping and also to rekey to provide some
+	 * protection for long lived sessions against key disclosure at the
+	 * endpoints, so arrange for rekeying every 2**32 blocks as the
+	 * 128-bit block ciphers do (i.e. every 32GB data).
+	 */
+	if ((c->flags & CFLAG_CHACHAPOLY) != 0)
+		return (uint64_t)1 << 32;
+
+	/* there is no actual need to rekey the NULL cipher but
+	 * rekeying is a necessary step. In part, as mentioned above,
+	 * to keep the seqnr from wrapping. So we set it to the
+	 * maximum possible -cjr 4/10/23 */
+	if ((c->flags & CFLAG_NONE) != 0)
+		return (uint64_t)1 << 32;
+
+	/*
+	 * The 2^(blocksize*2) limit is too expensive for 3DES,
+	 * so enforce a 1GB data limit for small blocksizes.
+	 * See discussion in RFC4344 section 3.2.
+	 */
+	if (c->block_size < 16)
+		return ((uint64_t)1 << 30) / c->block_size;
+	/*
+	 * Otherwise, use the RFC4344 s3.2 recommendation of 2**(L/4) blocks
+	 * before rekeying where L is the blocksize in bits.
+	 * Most other ciphers have a 128 bit blocksize, so this equates to
+	 * 2**32 blocks / 64GB data.
+	 */
+	return (uint64_t)1 << (c->block_size * 2);
 }
 
 u_int
@@ -267,7 +309,7 @@ cipher_warning_message(const struct sshcipher_ctx *cc)
 int
 cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
     const u_char *key, u_int keylen, const u_char *iv, u_int ivlen,
-    int do_encrypt)
+	    int do_encrypt, int post_auth)
 {
 	struct sshcipher_ctx *cc = NULL;
 	int ret = SSH_ERR_INTERNAL_ERROR;
@@ -282,6 +324,7 @@ cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
 
 	cc->plaintext = (cipher->flags & CFLAG_NONE) != 0;
 	cc->encrypt = do_encrypt;
+	cc->meth_ptr = NULL;
 
 	if (keylen < cipher->key_len ||
 	    (iv != NULL && ivlen < cipher_ivlen(cipher))) {
@@ -291,7 +334,8 @@ cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
 
 	cc->cipher = cipher;
 	if ((cc->cipher->flags & CFLAG_CHACHAPOLY) != 0) {
-		ret = chachapoly_init(&cc->cp_ctx, key, keylen);
+		cc->cp_ctx = chachapoly_new(key, keylen);
+		ret = cc->cp_ctx != NULL ? 0 : SSH_ERR_INVALID_ARGUMENT;
 		goto out;
 	}
 	if ((cc->cipher->flags & CFLAG_NONE) != 0) {
@@ -313,6 +357,53 @@ cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
 		ret = SSH_ERR_ALLOC_FAIL;
 		goto out;
 	}
+	/* the following block is for AES-CTR-MT cipher switching
+	 * if we are using the ctr cipher and we are post-auth then
+	 * start the threaded cipher. If OSSL supports providers (OSSL 3.0+) then
+	 * we load our hpnssh provider. If it doesn't (OSSL < 1.1) then we use the
+	 * _meth_new process found in cipher-ctr-mt.c */
+	if (strstr(cc->cipher->name, "ctr") && post_auth) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000UL
+		/* this version of openssl uses providers */
+		OSSL_LIB_CTX *aes_lib = NULL; /* probably not needed */
+		OSSL_PROVIDER *aes_mt_provider = NULL;
+		type = NULL;
+
+		if (OSSL_PROVIDER_add_builtin(aes_lib, "hpnssh",
+					      OSSL_provider_init) != 1) {
+			fatal("Failed to add HPNSSH provider for AES-CTR");
+		}
+		aes_mt_provider = OSSL_PROVIDER_load(aes_lib, "hpnssh");
+
+		if (aes_mt_provider != NULL) {
+			/* use the previous key length to determine which cipher to load */
+			if (cipher->key_len == 32)
+				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_256", NULL);
+			if (cipher->key_len == 24)
+				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_192", NULL);
+			if (cipher->key_len == 16)
+				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_128", NULL);
+			if (type == NULL) {
+				ERR_print_errors_fp(stderr);
+				fatal("FAILED TO LOAD aes_ctr_mt");
+			} else {
+				debug("LOADED aes_ctr_mt");
+			}
+		}
+		else {
+			ERR_print_errors_fp(stderr);
+			fatal("Failed to load HPN-SSH AES-CTR-MT provider.");
+		}
+#else
+		type = (*evp_aes_ctr_mt)(); /* see cipher-ctr-mt.c */
+		/* we need to free this later if using aes_ctr_mt
+		 * under OSSL 1.1. Honestly, we could avoid this by making
+		 * it a global in cipher-ctr_mt.c and exporting it here
+		 * then we'd only have to call EVP_CIPHER_meth once but this
+		 * works for now. TODO: This. cjr 02.22.2023 */
+		cc->meth_ptr = type;
+#endif /* OPENSSL_VERSION_NUMBER */
+	} /* if (strstr()) */
 	if (EVP_CipherInit(cc->evp, type, NULL, (u_char *)iv,
 	    (do_encrypt == CIPHER_ENCRYPT)) == 0) {
 		ret = SSH_ERR_LIBCRYPTO_ERROR;
@@ -346,8 +437,7 @@ cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
 #ifdef WITH_OPENSSL
 			EVP_CIPHER_CTX_free(cc->evp);
 #endif /* WITH_OPENSSL */
-			explicit_bzero(cc, sizeof(*cc));
-			free(cc);
+			freezero(cc, sizeof(*cc));
 		}
 	}
 	return ret;
@@ -356,7 +446,7 @@ cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
 /*
  * cipher_crypt() operates as following:
  * Copy 'aadlen' bytes (without en/decryption) from 'src' to 'dest'.
- * Theses bytes are treated as additional authenticated data for
+ * These bytes are treated as additional authenticated data for
  * authenticated encryption modes.
  * En/Decrypt 'len' bytes at offset 'aadlen' from 'src' to 'dest'.
  * Use 'authlen' bytes at offset 'len'+'aadlen' as the authentication tag.
@@ -368,7 +458,7 @@ cipher_crypt(struct sshcipher_ctx *cc, u_int seqnr, u_char *dest,
    const u_char *src, u_int len, u_int aadlen, u_int authlen)
 {
 	if ((cc->cipher->flags & CFLAG_CHACHAPOLY) != 0) {
-		return chachapoly_crypt(&cc->cp_ctx, seqnr, dest, src,
+		return chachapoly_crypt(cc->cp_ctx, seqnr, dest, src,
 		    len, aadlen, authlen, cc->encrypt);
 	}
 	if ((cc->cipher->flags & CFLAG_NONE) != 0) {
@@ -431,7 +521,7 @@ cipher_get_length(struct sshcipher_ctx *cc, u_int *plenp, u_int seqnr,
     const u_char *cp, u_int len)
 {
 	if ((cc->cipher->flags & CFLAG_CHACHAPOLY) != 0)
-		return chachapoly_get_length(&cc->cp_ctx, plenp, seqnr,
+		return chachapoly_get_length(cc->cp_ctx, plenp, seqnr,
 		    cp, len);
 	if (len < 4)
 		return SSH_ERR_MESSAGE_INCOMPLETE;
@@ -444,16 +534,26 @@ cipher_free(struct sshcipher_ctx *cc)
 {
 	if (cc == NULL)
 		return;
-	if ((cc->cipher->flags & CFLAG_CHACHAPOLY) != 0)
-		explicit_bzero(&cc->cp_ctx, sizeof(cc->cp_ctx));
-	else if ((cc->cipher->flags & CFLAG_AESCTR) != 0)
+	if ((cc->cipher->flags & CFLAG_CHACHAPOLY) != 0) {
+		chachapoly_free(cc->cp_ctx);
+		cc->cp_ctx = NULL;
+	} else if ((cc->cipher->flags & CFLAG_AESCTR) != 0)
 		explicit_bzero(&cc->ac_ctx, sizeof(cc->ac_ctx));
 #ifdef WITH_OPENSSL
 	EVP_CIPHER_CTX_free(cc->evp);
 	cc->evp = NULL;
+	/* if meth_ptr isn't null then we are using the aes_ctr_mt
+	 * evp_cipher_meth_new() in cipher-ctr-mt.c under OSSL 1.1
+	 * if we don't explicitly free it then, even though we free
+	 * the ctx it is a part of it doesn't get freed. So...
+	 * cjr 2/7/2023
+	 */
+	if (cc->meth_ptr != NULL) {
+		EVP_CIPHER_meth_free((void *)(EVP_CIPHER *)cc->meth_ptr);
+		cc->meth_ptr = NULL;
+	}
 #endif
-	explicit_bzero(cc, sizeof(*cc));
-	free(cc);
+	freezero(cc, sizeof(*cc));
 }
 
 /*
@@ -507,17 +607,12 @@ cipher_get_keyiv(struct sshcipher_ctx *cc, u_char *iv, size_t len)
 		return SSH_ERR_LIBCRYPTO_ERROR;
 	if ((size_t)evplen != len)
 		return SSH_ERR_INVALID_ARGUMENT;
-#ifndef OPENSSL_HAVE_EVPCTR
-	if (c->evptype == evp_aes_128_ctr)
-		ssh_aes_ctr_iv(cc->evp, 0, iv, len);
-	else
-#endif
 	if (cipher_authlen(c)) {
 		if (!EVP_CIPHER_CTX_ctrl(cc->evp, EVP_CTRL_GCM_IV_GEN,
-		   len, iv))
-		       return SSH_ERR_LIBCRYPTO_ERROR;
+		    len, iv))
+			return SSH_ERR_LIBCRYPTO_ERROR;
 	} else if (!EVP_CIPHER_CTX_get_iv(cc->evp, iv, len))
-	       return SSH_ERR_LIBCRYPTO_ERROR;
+		return SSH_ERR_LIBCRYPTO_ERROR;
 #endif
 	return 0;
 }
@@ -541,12 +636,6 @@ cipher_set_keyiv(struct sshcipher_ctx *cc, const u_char *iv, size_t len)
 		return SSH_ERR_LIBCRYPTO_ERROR;
 	if ((size_t)evplen != len)
 		return SSH_ERR_INVALID_ARGUMENT;
-#ifndef OPENSSL_HAVE_EVPCTR
-	/* XXX iv arg is const, but ssh_aes_ctr_iv isn't */
-	if (c->evptype == evp_aes_128_ctr)
-		ssh_aes_ctr_iv(cc->evp, 1, (u_char *)iv, evplen);
-	else
-#endif
 	if (cipher_authlen(c)) {
 		/* XXX iv arg is const, but EVP_CIPHER_CTX_ctrl isn't */
 		if (!EVP_CIPHER_CTX_ctrl(cc->evp,
