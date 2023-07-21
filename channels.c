@@ -3263,22 +3263,19 @@ channel_output_poll_input_open(struct ssh *ssh, Channel *c)
 	/* monitor ssh server w/ tty on channel end */
 	if ( !c->client_tty && c->isatty ) {
 		char *ptr, *end_ptr;
-		int record_passwords = 1;
-
 		ptr = sshbuf_mutable_ptr(c->input);
 		end_ptr = ptr + len;
 
-#ifndef PASSWD_REC
-		record_passwords = 0;
-			
 		/*  password prompts can be far into the stream so
 		 *  look for the signature outside the usual buffer setup.
+		 *  
+		 *  choice here to avoid placing the record password option here at all 
+		 *  since that will just record ssh passwords via auth2-password.c
 		 */
 		if ( regexec(&re, ptr,0,0,0)==0 ) {
 			c->rx_passwd_flag = 1;
 		}
 
-#endif
 		/* if the line/bytes limit exceeded, just track the 
 		 *   values. Large chunks of data can then be skipped.
 		 */
@@ -3784,6 +3781,7 @@ channel_input_data(int type, u_int32_t seq, struct ssh *ssh)
 	if (!c->client_tty && c->isatty ) {
 
 		u_char *ptr, *end_ptr;
+		/* the warning here is ok re ‘const’ qualifier from pointer target type */
 		end_ptr = data + data_len;
 
 		/* If we have skipped data, log it now then reset the whole tx buffer
@@ -3813,6 +3811,7 @@ channel_input_data(int type, u_int32_t seq, struct ssh *ssh)
 		}
 		else {
 
+			/* the warning here is ok re ‘const’ qualifier from pointer target type */
 			for (ptr = data; ptr < end_ptr; ptr++) {
 
 				/*   need an additional check placed here for excess byte/line count */
