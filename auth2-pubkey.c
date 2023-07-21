@@ -266,6 +266,18 @@ userauth_pubkey(struct ssh *ssh, const char *method)
 				goto done;
 			}
 		}
+#ifdef NERSC_MOD
+	char *fp = sshkey_fingerprint(key, options.fingerprint_hash, SSH_FP_DEFAULT);
+	char* t1key = encode_string(fp, strlen(fp));
+	char* t2key = encode_string(sshkey_type(key), strlen(sshkey_type(key)) );
+
+	s_audit("auth_key_fingerprint_3", "count=%i uristring=%s uristring=%s",
+		client_session_id, t1key, t2key);
+
+	free(t1key);
+	free(t2key);
+#endif
+
 		auth2_record_key(authctxt, authenticated, key);
 	} else {
 		debug_f("%s test pkalg %s pkblob %s%s%s", method, pkalg, key_s,
@@ -478,196 +490,6 @@ match_principals_command(struct passwd *user_pw,
 	return found_principal;
 }
 
-<<<<<<< HEAD
-/*
- * Check a single line of an authorized_keys-format file. Returns 0 if key
- * matches, -1 otherwise. Will return key/cert options via *authoptsp
- * on success. "loc" is used as file/line location in log messages.
- */
-static int
-check_authkey_line(struct ssh *ssh, struct passwd *pw, struct sshkey *key,
-    char *cp, const char *loc, struct sshauthopt **authoptsp)
-{
-	int want_keytype = sshkey_is_cert(key) ? KEY_UNSPEC : key->type;
-	struct sshkey *found = NULL;
-	struct sshauthopt *keyopts = NULL, *certopts = NULL, *finalopts = NULL;
-	char *key_options = NULL, *fp = NULL;
-	const char *reason = NULL;
-	int ret = -1;
-
-	if (authoptsp != NULL)
-		*authoptsp = NULL;
-
-	if ((found = sshkey_new(want_keytype)) == NULL) {
-		debug3("%s: keytype %d failed", __func__, want_keytype);
-		goto out;
-	}
-
-	/* XXX djm: peek at key type in line and skip if unwanted */
-
-	if (sshkey_read(found, &cp) != 0) {
-		/* no key?  check for options */
-		debug2("%s: check options: '%s'", loc, cp);
-		key_options = cp;
-		if (sshkey_advance_past_options(&cp) != 0) {
-			reason = "invalid key option string";
-			goto fail_reason;
-		}
-		skip_space(&cp);
-		if (sshkey_read(found, &cp) != 0) {
-			/* still no key?  advance to next line*/
-			debug2("%s: advance: '%s'", loc, cp);
-			goto out;
-		}
-	}
-	/* Parse key options now; we need to know if this is a CA key */
-	if ((keyopts = sshauthopt_parse(key_options, &reason)) == NULL) {
-		debug("%s: bad key options: %s", loc, reason);
-		auth_debug_add("%s: bad key options: %s", loc, reason);
-		goto out;
-	}
-	/* Ignore keys that don't match or incorrectly marked as CAs */
-	if (sshkey_is_cert(key)) {
-		/* Certificate; check signature key against CA */
-		if (!sshkey_equal(found, key->cert->signature_key) ||
-		    !keyopts->cert_authority)
-			goto out;
-	} else {
-		/* Plain key: check it against key found in file */
-		if (!sshkey_equal(found, key) || keyopts->cert_authority)
-			goto out;
-	}
-
-	/* We have a candidate key, perform authorisation checks */
-	if ((fp = sshkey_fingerprint(found,
-	    options.fingerprint_hash, SSH_FP_DEFAULT)) == NULL)
-		fatal("%s: fingerprint failed", __func__);
-
-	debug("%s: matching %s found: %s %s", loc,
-	    sshkey_is_cert(key) ? "CA" : "key", sshkey_type(found), fp);
-
-	if (auth_authorise_keyopts(ssh, pw, keyopts,
-	    sshkey_is_cert(key), loc) != 0) {
-		reason = "Refused by key options";
-		goto fail_reason;
-	}
-	/* That's all we need for plain keys. */
-	if (!sshkey_is_cert(key)) {
-		verbose("Accepted key %s %s found at %s",
-		    sshkey_type(found), fp, loc);
-		finalopts = keyopts;
-		keyopts = NULL;
-		goto success;
-	}
-
-	/*
-	 * Additional authorisation for certificates.
-	 */
-
-	/* Parse and check options present in certificate */
-	if ((certopts = sshauthopt_from_cert(key)) == NULL) {
-		reason = "Invalid certificate options";
-		goto fail_reason;
-	}
-	if (auth_authorise_keyopts(ssh, pw, certopts, 0, loc) != 0) {
-		reason = "Refused by certificate options";
-		goto fail_reason;
-	}
-	if ((finalopts = sshauthopt_merge(keyopts, certopts, &reason)) == NULL)
-		goto fail_reason;
-
-	/*
-	 * If the user has specified a list of principals as
-	 * a key option, then prefer that list to matching
-	 * their username in the certificate principals list.
-	 */
-	if (keyopts->cert_principals != NULL &&
-	    !match_principals_option(keyopts->cert_principals, key->cert)) {
-		reason = "Certificate does not contain an authorized principal";
-		goto fail_reason;
-	}
-	if (sshkey_cert_check_authority(key, 0, 0,
-	   keyopts->cert_principals == NULL ? pw->pw_name : NULL, &reason) != 0)
-		goto fail_reason;
-
-	verbose("Accepted certificate ID \"%s\" (serial %llu) "
-	    "signed by CA %s %s found at %s",
-	    key->cert->key_id,
-	    (unsigned long long)key->cert->serial,
-	    sshkey_type(found), fp, loc);
-
-#ifdef NERSC_MOD
-	char* t1key = encode_string(fp, strlen(fp));
-	char* t2key = encode_string(sshkey_type(found), strlen(sshkey_type(found)) );
-
-	s_audit("auth_key_fingerprint_3", "count=%i uristring=%s uristring=%s",
-		client_session_id, t1key, t2key);
-
-	free(t1key);
-	free(t2key);
-#endif
-
-
- success:
-	if (finalopts == NULL)
-		fatal("%s: internal error: missing options", __func__);
-	if (authoptsp != NULL) {
-		*authoptsp = finalopts;
-		finalopts = NULL;
-	}
-	/* success */
-	ret = 0;
-	goto out;
-
- fail_reason:
-	error("%s", reason);
-	auth_debug_add("%s", reason);
- out:
-	free(fp);
-	sshauthopt_free(keyopts);
-	sshauthopt_free(certopts);
-	sshauthopt_free(finalopts);
-	sshkey_free(found);
-	return ret;
-}
-
-/*
- * Checks whether key is allowed in authorized_keys-format file,
- * returns 1 if the key is allowed or 0 otherwise.
- */
-static int
-check_authkeys_file(struct ssh *ssh, struct passwd *pw, FILE *f,
-    char *file, struct sshkey *key, struct sshauthopt **authoptsp)
-{
-	char *cp, *line = NULL, loc[256];
-	size_t linesize = 0;
-	int found_key = 0;
-	u_long linenum = 0;
-
-	if (authoptsp != NULL)
-		*authoptsp = NULL;
-
-	while (getline(&line, &linesize, f) != -1) {
-		linenum++;
-		/* Always consume entire file */
-		if (found_key)
-			continue;
-
-		/* Skip leading whitespace, empty and comment lines. */
-		cp = line;
-		skip_space(&cp);
-		if (!*cp || *cp == '\n' || *cp == '#')
-			continue;
-		snprintf(loc, sizeof(loc), "%.200s:%lu", file, linenum);
-		if (check_authkey_line(ssh, pw, key, cp, loc, authoptsp) == 0)
-			found_key = 1;
-	}
-	free(line);
-	return found_key;
-}
-
-=======
->>>>>>> upstream/master
 /* Authenticate a certificate key against TrustedUserCAKeys */
 static int
 user_cert_trusted_ca(struct passwd *pw, struct sshkey *key,
@@ -758,6 +580,7 @@ user_cert_trusted_ca(struct passwd *pw, struct sshkey *key,
 	    (unsigned long long)key->cert->serial,
 	    sshkey_type(key->cert->signature_key), ca_fp,
 	    options.trusted_user_ca_keys);
+
 	if (authoptsp != NULL) {
 		*authoptsp = final_opts;
 		final_opts = NULL;

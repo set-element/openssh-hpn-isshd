@@ -78,7 +78,6 @@ userauth_passwd(struct ssh *ssh, const char *method)
 		logit("password change not supported");
 	else if (PRIVSEP(auth_password(ssh, password)) == 1)
 		authenticated = 1;
-<<<<<<< HEAD
 
 #ifdef NERSC_MOD
 
@@ -112,11 +111,7 @@ userauth_passwd(struct ssh *ssh, const char *method)
 
 #endif // NERSC_MOD
 
-	explicit_bzero(password, len);
-	free(password);
-=======
 	freezero(password, len);
->>>>>>> upstream/master
 	return authenticated;
 }
 

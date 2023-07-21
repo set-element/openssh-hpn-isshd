@@ -150,7 +150,7 @@
 #include "modp_burl_data.h"
 
 /* import */
-int audit_disabled;
+//int audit_disabled = 0;
 extern char *__progname;
 
 int client_session_id;
@@ -199,7 +199,7 @@ void l_syslog(const char *fmt,...)
 		va_list args;
 
 		va_start(args, fmt);
-		do_log(SYSLOG_LEVEL_INFO, fmt, args);
+		do_log2(SYSLOG_LEVEL_INFO, fmt, args);
 		va_end(args);
 	}
 }
@@ -512,8 +512,8 @@ static int sis_write(char *buffer)
  */
 void s_audit(const char *_event, const char *fmt, ...)
 {
-	if ( audit_disabled == 1 )
-		return;
+	//if ( audit_disabled == 1 )
+	//	return;
 
 	va_list args;
 	char msgbuf[NERSCMSGBUF] = "";
