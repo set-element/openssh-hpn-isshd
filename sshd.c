@@ -332,7 +332,7 @@ sighup_restart(void)
 
 	struct listenaddr *li;
 	char ntop[NI_MAXHOST], strport[NI_MAXSERV];
-	int i;
+	u_int i;
 
 	for (i = 0; i < options.num_listen_addrs; i++) {
 
@@ -1171,11 +1171,10 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 	struct addrinfo *ai;
 	char ntop[NI_MAXHOST], strport[NI_MAXSERV];
 
-	ai = options.listen_addrs;
+	ai = options.listen_addrs->addrs;
 	struct timespec l_tv;
 #endif 
 
-	//fd_set *fdset;
 	struct pollfd *pfd = NULL;
 	int i, j, ret, npfd;
 	int ostartups = -1, startups = 0, listening = 0, lameduck = 0;
