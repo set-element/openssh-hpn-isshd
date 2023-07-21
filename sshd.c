@@ -1223,12 +1223,16 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 			if (options.pid_file != NULL)
 				unlink(options.pid_file);
 
+/*
+ * taking this out for the time being as it is causing issues with NERSC
+ *
 #ifdef NERSC_MOD
 			if (  getnameinfo(ai->ai_addr, ai->ai_addrlen,ntop, sizeof(ntop), strport,
 					sizeof(strport),NI_NUMERICHOST|NI_NUMERICSERV) == 0) {
 				s_audit("sshd_exit_3", "addr=%s  port=%s/tcp", ntop, strport);
 			}
 #endif
+ */
 			exit(received_sigterm == SIGTERM ? 0 : 255);
 		}
 		if (ostartups != startups) {
