@@ -48,9 +48,3 @@ hpnsshd
 !regress/unittests/sshsig/Makefile
 tags
 
-# Ignored on main branch
-config.h.in
-configure
-aclocal.m4
-ChangeLog
-**/*.0
