@@ -95,9 +95,7 @@ for i in $macs; do
 done
 
 for opt in $opts; do
-        verbose "client rekey $opt"
-        if ${SSH} -Q cipher-auth | sed 's/^/Ciphers=/' | \
-            grep $opt >/dev/null; then
+	verbose "client rekey $opt"
 	if ${SSH} -Q cipher-auth | sed 's/^/Ciphers=/' | \
 	    grep $opt >/dev/null; then
 		trace AEAD cipher, testing all KexAlgorithms
