@@ -75,7 +75,14 @@ opts=""
 # Filter out duplicate curve algo
 kexs=`${SSH} -Q kex | grep -v curve25519-sha256@libssh.org`
 ciphers=`${SSH} -Q cipher`
-macs=`${SSH} -Q mac`
+
+# HPN-SSH enables the none MAC but this fails
+# in the regression tests because, by default,
+# we don't enable the none MAC so the test
+# will fail. As such, we skip it by
+# filtering it out.
+# CJR 9/30/2024
+macs=`${SSH} -Q mac | grep -v none`
 
 for i in $kexs; do
 	opts="$opts KexAlgorithms=$i"
@@ -88,14 +95,6 @@ for i in $macs; do
 done
 
 for opt in $opts; do
-	# HPN-SSH enables the none MAC but this fails
-	# in the regression tests because, by default,
-	# we don't enable the none MAC so the test
-	# will fail. As such, skip it.
-	# CJR 9/30/2024
-	if echo ${opt} | grep -Eq "none"; then
-	    continue
-	fi
         verbose "client rekey $opt"
         if ${SSH} -Q cipher-auth | sed 's/^/Ciphers=/' | \
             grep $opt >/dev/null; then
