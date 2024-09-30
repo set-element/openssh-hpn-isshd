@@ -88,7 +88,17 @@ for i in $macs; do
 done
 
 for opt in $opts; do
-	verbose "client rekey $opt"
+	# HPN-SSH enables the none MAC but this fails
+	# in the regression tests because, by default,
+	# we don't enable the none MAC so the test
+	# will fail. As such, skip it.
+	# CJR 9/30/2024
+	if echo ${opt} | grep -Eq "none"; then
+	    continue
+	fi
+        verbose "client rekey $opt"
+        if ${SSH} -Q cipher-auth | sed 's/^/Ciphers=/' | \
+            grep $opt >/dev/null; then
 	if ${SSH} -Q cipher-auth | sed 's/^/Ciphers=/' | \
 	    grep $opt >/dev/null; then
 		trace AEAD cipher, testing all KexAlgorithms
