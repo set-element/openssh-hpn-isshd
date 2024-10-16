@@ -49,7 +49,8 @@ Releases include a pre-built copy of the ``configure`` script and may be built u
 
 ```
 tar zxvf hpnssh-X.YpZ.tar.gz
-cd hpnssh
+cd hpn-ssh
+autoreconf -f -i
 ./configure # [options]
 make && make tests
 ```
@@ -62,8 +63,8 @@ If building from git, you'll need [autoconf](https://www.gnu.org/software/autoco
 
 ```
 git clone https://github.com/rapier1/hpn-ssh
-cd openssh-portable
-autoreconf
+cd hpn-ssh
+autoreconf -f -i
 ./configure
 make && make tests
 ```
