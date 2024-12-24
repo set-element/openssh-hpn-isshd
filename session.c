@@ -1,4 +1,4 @@
-/* $OpenBSD: session.c,v 1.330 2022/02/08 08:59:12 dtucker Exp $ */
+/* $OpenBSD: session.c,v 1.338 2024/05/17 00:30:24 djm Exp $ */
 /*
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
  *                    All rights reserved
@@ -72,7 +72,6 @@
 #include "ssherr.h"
 #include "match.h"
 #include "uidswap.h"
-#include "compat.h"
 #include "channels.h"
 #include "sshkey.h"
 #include "cipher.h"
@@ -95,7 +94,7 @@
 #include "monitor_wrap.h"
 #include "sftp.h"
 #include "atomicio.h"
-
+#include "cipher-switch.h"
 
 #if defined(KRB5) && defined(USE_AFS)
 #include <kafs.h>
@@ -103,6 +102,17 @@
 
 #ifdef WITH_SELINUX
 #include <selinux/selinux.h>
+#endif
+
+/*
+ * Hack for systems that do not support FD passing: allocate PTYs directly
+ * without calling into the monitor. This requires either the post-auth
+ * privsep process retain root privileges (see the comment in
+ * sshd-session.c:privsep_postauth) or that PTY allocation doesn't require
+ * privileges to begin with (e.g. Cygwin).
+ */
+#ifdef DISABLE_FD_PASSING
+#define mm_pty_allocate pty_allocate
 #endif
 
 #define IS_INTERNAL_SFTP(c) \
@@ -224,7 +234,7 @@ auth_input_request_forwarding(struct ssh *ssh, struct passwd * pw)
 
 	/* Allocate a channel for the authentication agent socket. */
 	/* this shouldn't matter if its hpn or not - cjr */
-	nc = channel_new(ssh, "auth socket",
+	nc = channel_new(ssh, "auth-listener",
 	    SSH_CHANNEL_AUTH_SOCKET, sock, sock, -1,
 	    CHAN_X11_WINDOW_DEFAULT, CHAN_X11_PACKET_DEFAULT,
 	    0, "auth socket", 1);
@@ -457,7 +467,7 @@ do_exec_no_pty(struct ssh *ssh, Session *s, const char *command)
 		return -1;
 	case 0:
 		is_child = 1;
-	  
+
 		/*
 		 * Create a new session and process group since the 4.4BSD
 		 * setlogin() affects the entire process group.
@@ -547,6 +557,9 @@ do_exec_no_pty(struct ssh *ssh, Session *s, const char *command)
 	session_set_fds(ssh, s, inout[1], inout[1], err[1],
 	    s->is_subsystem, 0);
 #endif
+	/* switch to the parallel ciphers if necessary */
+	if (options.disable_multithreaded == 0)
+		cipher_switch(ssh);
 	return 0;
 }
 
@@ -600,7 +613,7 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 		return -1;
 	case 0:
 		is_child = 1;
-	
+
 		close(fdout);
 		close(ptymaster);
 
@@ -649,6 +662,9 @@ do_exec_pty(struct ssh *ssh, Session *s, const char *command)
 	ssh_packet_set_interactive(ssh, 1,
 	    options.ip_qos_interactive, options.ip_qos_bulk);
 	session_set_fds(ssh, s, ptyfd, fdout, -1, 1, 1);
+	/* switch to the parallel cipher if appropriate */
+	if (options.disable_multithreaded == 0)
+		cipher_switch(ssh);
 	return 0;
 }
 
@@ -709,13 +725,13 @@ do_exec(struct ssh *ssh, Session *s, const char *command)
 
 #ifdef SSH_AUDIT_EVENTS
 	if (command != NULL)
-		PRIVSEP(audit_run_command(command));
+		mm_audit_run_command(command);
 	else if (s->ttyfd == -1) {
 		char *shell = s->pw->pw_shell;
 
 		if (shell[0] == '\0')	/* empty shell means /bin/sh */
 			shell =_PATH_BSHELL;
-		PRIVSEP(audit_run_command(shell));
+		mm_audit_run_command(shell);
 	}
 #endif
 	if (s->ttyfd != -1)
@@ -741,8 +757,6 @@ do_login(struct ssh *ssh, Session *s, const char *command)
 {
 	socklen_t fromlen;
 	struct sockaddr_storage from;
-	struct passwd * pw = s->pw;
-	pid_t pid = getpid();
 
 	/*
 	 * Get IP address of client. If the connection is not a socket, let
@@ -757,26 +771,6 @@ do_login(struct ssh *ssh, Session *s, const char *command)
 			cleanup_exit(255);
 		}
 	}
-
-	/* Record that there was a login on that tty from the remote host. */
-	if (!use_privsep)
-		record_login(pid, s->tty, pw->pw_name, pw->pw_uid,
-		    session_get_remote_name_or_ip(ssh, utmp_len,
-		    options.use_dns),
-		    (struct sockaddr *)&from, fromlen);
-
-#ifdef USE_PAM
-	/*
-	 * If password change is needed, do it now.
-	 * This needs to occur before the ~/.hushlogin check.
-	 */
-	if (options.use_pam && !use_privsep && s->authctxt->force_pwchange) {
-		display_loginmsg();
-		do_pam_chauthtok();
-		s->authctxt->force_pwchange = 0;
-		/* XXX - signal [net] parent to enable forwardings */
-	}
-#endif
 
 	if (check_quietlogin(s, command))
 		return;
@@ -1161,6 +1155,7 @@ do_setup_env(struct ssh *ssh, Session *s, const char *shell)
 		}
 		*value++ = '\0';
 		child_set_env(&env, &envsize, cp, value);
+		free(cp);
 	}
 
 	/* SSH_CLIENT deprecated */
@@ -1329,7 +1324,7 @@ safely_chroot(const char *path, uid_t uid)
 			memcpy(component, path, cp - path);
 			component[cp - path] = '\0';
 		}
-	
+
 		debug3_f("checking '%s'", component);
 
 		if (stat(component, &st) != 0)
@@ -1409,7 +1404,7 @@ do_setusercontext(struct passwd *pw)
 			perror("unable to set user context (setuser)");
 			exit(1);
 		}
-		/* 
+		/*
 		 * FreeBSD's setusercontext() will not apply the user's
 		 * own umask setting unless running with the user's UID.
 		 */
@@ -1926,8 +1921,7 @@ session_pty_req(struct ssh *ssh, Session *s)
 
 	/* Allocate a pty and open it. */
 	debug("Allocating pty.");
-	if (!PRIVSEP(pty_allocate(&s->ptyfd, &s->ttyfd, s->tty,
-	    sizeof(s->tty)))) {
+	if (!mm_pty_allocate(&s->ptyfd, &s->ttyfd, s->tty, sizeof(s->tty))) {
 		free(s->term);
 		s->term = NULL;
 		s->ptyfd = -1;
@@ -1942,9 +1936,6 @@ session_pty_req(struct ssh *ssh, Session *s)
 	if ((r = sshpkt_get_end(ssh)) != 0)
 		sshpkt_fatal(ssh, r, "%s: parse packet", __func__);
 
-	if (!use_privsep)
-		pty_setowner(s->pw, s->tty);
-
 	/* Set window size from the packet. */
 	pty_change_window_size(s->ptyfd, s->row, s->col, s->xpixel, s->ypixel);
 
@@ -1957,7 +1948,7 @@ session_subsystem_req(struct ssh *ssh, Session *s)
 {
 	struct stat st;
 	int r, success = 0;
-	char *prog, *cmd;
+	char *prog, *cmd, *type;
 	u_int i;
 
 	if ((r = sshpkt_get_cstring(ssh, &s->subsys, NULL)) != 0 ||
@@ -1980,6 +1971,10 @@ session_subsystem_req(struct ssh *ssh, Session *s)
 				s->is_subsystem = SUBSYSTEM_EXT;
 				debug("subsystem: exec() %s", cmd);
 			}
+			xasprintf(&type, "session:subsystem:%s",
+			    options.subsystem_name[i]);
+			channel_set_xtype(ssh, s->chanid, type);
+			free(type);
 			success = do_exec(ssh, s, cmd) == 0;
 			break;
 		}
@@ -2035,6 +2030,9 @@ session_shell_req(struct ssh *ssh, Session *s)
 
 	if ((r = sshpkt_get_end(ssh)) != 0)
 		sshpkt_fatal(ssh, r, "%s: parse packet", __func__);
+
+	channel_set_xtype(ssh, s->chanid, "session:shell");
+
 	return do_exec(ssh, s, NULL) == 0;
 }
 
@@ -2048,6 +2046,8 @@ session_exec_req(struct ssh *ssh, Session *s)
 	if ((r = sshpkt_get_cstring(ssh, &command, NULL)) != 0 ||
 	    (r = sshpkt_get_end(ssh)) != 0)
 		sshpkt_fatal(ssh, r, "%s: parse packet", __func__);
+
+	channel_set_xtype(ssh, s->chanid, "session:command");
 
 	success = do_exec(ssh, s, command) == 0;
 	free(command);
@@ -2153,7 +2153,7 @@ session_signal_req(struct ssh *ssh, Session *s)
 		    signame, s->forced ? "forced-command" : "subsystem");
 		goto out;
 	}
-	if (!use_privsep || mm_is_monitor()) {
+	if (mm_is_monitor()) {
 		error_f("session signalling requires privilege separation");
 		goto out;
 	}
@@ -2253,8 +2253,7 @@ session_set_fds(struct ssh *ssh, Session *s,
         channel_set_fds(ssh, s->chanid,
 			fdout, fdin, fderr,
 			ignore_fderr ? CHAN_EXTENDED_IGNORE : CHAN_EXTENDED_READ,
-			1, is_tty,
-			options.hpn_disabled ? CHAN_SES_WINDOW_DEFAULT : options.hpn_buffer_size);
+			1, is_tty, CHAN_SES_WINDOW_DEFAULT);
 }
 
 /*
@@ -2297,7 +2296,7 @@ session_pty_cleanup2(Session *s)
 void
 session_pty_cleanup(Session *s)
 {
-	PRIVSEP(session_pty_cleanup2(s));
+	mm_session_pty_cleanup2(s);
 }
 
 static char *
@@ -2338,7 +2337,7 @@ session_close_x11(struct ssh *ssh, int id)
 }
 
 static void
-session_close_single_x11(struct ssh *ssh, int id, void *arg)
+session_close_single_x11(struct ssh *ssh, int id, int force, void *arg)
 {
 	Session *s;
 	u_int i;
@@ -2374,17 +2373,17 @@ session_exit_message(struct ssh *ssh, Session *s, int status)
 {
 	Channel *c;
 	int r;
+	char *note = NULL;
 
 	if ((c = channel_lookup(ssh, s->chanid)) == NULL)
 		fatal_f("session %d: no channel %d", s->self, s->chanid);
-	debug_f("session %d channel %d pid %ld",
-	    s->self, s->chanid, (long)s->pid);
 
 	if (WIFEXITED(status)) {
 		channel_request_start(ssh, s->chanid, "exit-status", 0);
 		if ((r = sshpkt_put_u32(ssh, WEXITSTATUS(status))) != 0 ||
 		    (r = sshpkt_send(ssh)) != 0)
 			sshpkt_fatal(ssh, r, "%s: exit reply", __func__);
+		xasprintf(&note, "exit %d", WEXITSTATUS(status));
 	} else if (WIFSIGNALED(status)) {
 		channel_request_start(ssh, s->chanid, "exit-signal", 0);
 #ifndef WCOREDUMP
@@ -2396,10 +2395,17 @@ session_exit_message(struct ssh *ssh, Session *s, int status)
 		    (r = sshpkt_put_cstring(ssh, "")) != 0 ||
 		    (r = sshpkt_send(ssh)) != 0)
 			sshpkt_fatal(ssh, r, "%s: exit reply", __func__);
+		xasprintf(&note, "signal %d%s", WTERMSIG(status),
+		    WCOREDUMP(status) ? " core dumped" : "");
 	} else {
 		/* Some weird exit cause.  Just exit. */
-		ssh_packet_disconnect(ssh, "wait returned status %04x.", status);
+		ssh_packet_disconnect(ssh, "wait returned status %04x.",
+		    status);
 	}
+
+	debug_f("session %d channel %d pid %ld %s", s->self, s->chanid,
+	    (long)s->pid, note == NULL ? "UNKNOWN" : note);
+	free(note);
 
 	/* disconnect channel */
 	debug_f("release channel %d", s->chanid);
@@ -2472,7 +2478,7 @@ session_close_by_pid(struct ssh *ssh, pid_t pid, int status)
  * the session 'child' itself dies
  */
 void
-session_close_by_channel(struct ssh *ssh, int id, void *arg)
+session_close_by_channel(struct ssh *ssh, int id, int force, void *arg)
 {
 	Session *s = session_by_channel(id);
 	u_int i;
@@ -2485,12 +2491,14 @@ session_close_by_channel(struct ssh *ssh, int id, void *arg)
 	if (s->pid != 0) {
 		debug_f("channel %d: has child, ttyfd %d", id, s->ttyfd);
 		/*
-		 * delay detach of session, but release pty, since
-		 * the fd's to the child are already closed
+		 * delay detach of session (unless this is a forced close),
+		 * but release pty, since the fd's to the child are already
+		 * closed
 		 */
 		if (s->ttyfd != -1)
 			session_pty_cleanup(s);
-		return;
+		if (!force)
+			return;
 	}
 	/* detach by removing callback */
 	channel_cancel_cleanup(ssh, s->chanid);
@@ -2697,7 +2705,7 @@ do_cleanup(struct ssh *ssh, Authctxt *authctxt)
 	 * Cleanup ptys/utmp only if privsep is disabled,
 	 * or if running in monitor.
 	 */
-	if (!use_privsep || mm_is_monitor())
+	if (mm_is_monitor())
 		session_destroy_all(ssh, session_pty_cleanup2);
 }
 
@@ -2714,4 +2722,3 @@ session_get_remote_name_or_ip(struct ssh *ssh, u_int utmp_size, int use_dns)
 		remote = ssh_remote_ipaddr(ssh);
 	return remote;
 }
-

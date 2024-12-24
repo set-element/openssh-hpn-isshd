@@ -1,4 +1,4 @@
-/* $OpenBSD: scp.c,v 1.247 2022/03/20 08:52:17 djm Exp $ */
+/* $OpenBSD: scp.c,v 1.261 2024/06/26 23:14:14 deraadt Exp $ */
 /*
  * scp - secure remote copy.  This is basically patched BSD rcp which
  * uses ssh to do the data transfer (instead of using rcmd).
@@ -107,6 +107,9 @@
 #include <libgen.h>
 #endif
 #include <limits.h>
+#ifdef HAVE_UTIL_H
+# include <util.h>
+#endif
 #include <locale.h>
 #include <pwd.h>
 #include <signal.h>
@@ -131,7 +134,12 @@
 #include "misc.h"
 #include "progressmeter.h"
 #include "utf8.h"
+/* libressl doesn't support the blake2b512 digest so
+ * we need to prevent libressl from using the resume feature
+ * cjr 7/18/2023 */
+#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 #include <openssl/evp.h>
+#endif
 #include "sftp.h"
 
 #include "sftp-common.h"
@@ -182,10 +190,14 @@ char *remote_path;
 pid_t do_cmd_pid = -1;
 pid_t do_cmd_pid2 = -1;
 
+/* SFTP copy parameters */
+size_t sftp_copy_buflen;
+size_t sftp_nrequests;
+
 /* Needed for sftp */
 volatile sig_atomic_t interrupted = 0;
 
-int remote_glob(struct sftp_conn *, const char *, int,
+int sftp_glob(struct sftp_conn *, const char *, int,
     int (*)(const char *, int), glob_t *); /* proto for sftp-glob.c */
 
 /* Flag to indicate that this is a file resume */
@@ -194,16 +206,21 @@ int resume_flag = 0; /* 0 is off, 1 is on */
 /* we want the host name for debugging purposes */
 char hostname[HOST_NAME_MAX + 1];
 
+/* defines for the resume function. Need them even if not supported */
+#define HASH_LEN 128               /*40 sha1, 64 blake2s256 128 blake2b512*/
+#define BUF_AND_HASH HASH_LEN + 64 /* length of the hash and other data to get size of buffer */
+#define HASH_BUFLEN 8192	   /* 8192 seems to be a good balance between freads
+				    * and the digest func*/
 static void
 killchild(int signo)
 {
 	if (do_cmd_pid > 1) {
 		kill(do_cmd_pid, signo ? signo : SIGTERM);
-		waitpid(do_cmd_pid, NULL, 0);
+		(void)waitpid(do_cmd_pid, NULL, 0);
 	}
 	if (do_cmd_pid2 > 1) {
 		kill(do_cmd_pid2, signo ? signo : SIGTERM);
-		waitpid(do_cmd_pid2, NULL, 0);
+		(void)waitpid(do_cmd_pid2, NULL, 0);
 	}
 
 	if (signo)
@@ -227,9 +244,11 @@ suspone(int pid, int signo)
 static void
 suspchild(int signo)
 {
+	int save_errno = errno;
 	suspone(do_cmd_pid, signo);
 	suspone(do_cmd_pid2, signo);
 	kill(getpid(), SIGSTOP);
+	errno = save_errno;
 }
 
 static int
@@ -287,7 +306,11 @@ int
 do_cmd(char *program, char *host, char *remuser, int port, int subsystem,
     char *cmd, int *fdin, int *fdout, pid_t *pid)
 {
-	int pin[2], pout[2], reserved[2];
+#ifdef USE_PIPES
+	int pin[2], pout[2];
+#else
+	int sv[2];
+#endif
 
 	if (verbose_mode)
 		fmprintf(stderr,
@@ -298,22 +321,14 @@ do_cmd(char *program, char *host, char *remuser, int port, int subsystem,
 	if (port == -1)
 		port = sshport;
 
-	/*
-	 * Reserve two descriptors so that the real pipes won't get
-	 * descriptors 0 and 1 because that will screw up dup2 below.
-	 */
-	if (pipe(reserved) == -1)
+#ifdef USE_PIPES
+	if (pipe(pin) == -1 || pipe(pout) == -1)
 		fatal("pipe: %s", strerror(errno));
-
+#else
 	/* Create a socket pair for communicating with ssh. */
-	if (pipe(pin) == -1)
-		fatal("pipe: %s", strerror(errno));
-	if (pipe(pout) == -1)
-		fatal("pipe: %s", strerror(errno));
-
-	/* Free the reserved descriptors. */
-	close(reserved[0]);
-	close(reserved[1]);
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == -1)
+		fatal("socketpair: %s", strerror(errno));
+#endif
 
 	ssh_signal(SIGTSTP, suspchild);
 	ssh_signal(SIGTTIN, suspchild);
@@ -321,15 +336,30 @@ do_cmd(char *program, char *host, char *remuser, int port, int subsystem,
 
 	/* Fork a child to execute the command on the remote host using ssh. */
 	*pid = fork();
-	if (*pid == 0) {
+	switch (*pid) {
+	case -1:
+		fatal("fork: %s", strerror(errno));
+	case 0:
 		/* Child. */
+#ifdef USE_PIPES
+		if (dup2(pin[0], STDIN_FILENO) == -1 ||
+		    dup2(pout[1], STDOUT_FILENO) == -1) {
+			error("dup2: %s", strerror(errno));
+			_exit(1);
+		}
+		close(pin[0]);
 		close(pin[1]);
 		close(pout[0]);
-		dup2(pin[0], 0);
-		dup2(pout[1], 1);
-		close(pin[0]);
 		close(pout[1]);
-
+#else
+		if (dup2(sv[0], STDIN_FILENO) == -1 ||
+		    dup2(sv[0], STDOUT_FILENO) == -1) {
+			error("dup2: %s", strerror(errno));
+			_exit(1);
+		}
+		close(sv[0]);
+		close(sv[1]);
+#endif
 		replacearg(&args, 0, "%s", program);
 		if (port != -1) {
 			addargs(&args, "-p");
@@ -347,19 +377,24 @@ do_cmd(char *program, char *host, char *remuser, int port, int subsystem,
 
 		execvp(program, args.list);
 		perror(program);
-		exit(1);
-	} else if (*pid == -1) {
-		fatal("fork: %s", strerror(errno));
+		_exit(1);
+	default:
+		/* Parent.  Close the other side, and return the local side. */
+#ifdef USE_PIPES
+		close(pin[0]);
+		close(pout[1]);
+		*fdout = pin[1];
+		*fdin = pout[0];
+#else
+		close(sv[0]);
+		*fdin = sv[1];
+		*fdout = sv[1];
+#endif
+		ssh_signal(SIGTERM, killchild);
+		ssh_signal(SIGINT, killchild);
+		ssh_signal(SIGHUP, killchild);
+		return 0;
 	}
-	/* Parent.  Close the other side, and return the local side. */
-	close(pin[0]);
-	*fdout = pin[1];
-	close(pout[1]);
-	*fdin = pout[0];
-	ssh_signal(SIGTERM, killchild);
-	ssh_signal(SIGINT, killchild);
-	ssh_signal(SIGHUP, killchild);
-	return 0;
 }
 
 /*
@@ -386,8 +421,10 @@ do_cmd2(char *host, char *remuser, int port, char *cmd,
 	/* Fork a child to execute the command on the remote host using ssh. */
 	pid = fork();
 	if (pid == 0) {
-		dup2(fdin, 0);
-		dup2(fdout, 1);
+		if (dup2(fdin, 0) == -1)
+			perror("dup2");
+		if (dup2(fdout, 1) == -1)
+			perror("dup2");
 
 		replacearg(&args, 0, "%s", ssh_program);
 		if (port != -1) {
@@ -461,13 +498,14 @@ void throughlocal_sftp(struct sftp_conn *, struct sftp_conn *,
 int
 main(int argc, char **argv)
 {
-	int ch, fflag, tflag, status, n;
+	int ch, fflag, tflag, status, r, n;
 	char **newargv, *argv0;
 	const char *errstr;
 	extern char *optarg;
 	extern int optind;
 	enum scp_mode_e mode = MODE_SFTP;
 	char *sftp_direct = NULL;
+	long long llv;
 
 	/* we use this to prepend the debugging statements
 	 * so we know which side is saying what */
@@ -475,8 +513,6 @@ main(int argc, char **argv)
 
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
 	sanitise_stdfd();
-
-	seed_rng();
 
 	msetlocale();
 
@@ -506,7 +542,7 @@ main(int argc, char **argv)
 
 	fflag = Tflag = tflag = 0;
 	while ((ch = getopt(argc, argv,
-	    "12346ABCTdfOpqRrstvZz:D:F:J:M:P:S:c:i:l:o:")) != -1) {
+	    "12346ABCTdfOpqRrstvZD:F:J:M:P:S:c:i:l:o:X:")) != -1) {
 		switch (ch) {
 		/* User-visible flags. */
 		case '1':
@@ -573,9 +609,6 @@ main(int argc, char **argv)
 		case 'S':
 			ssh_program = xstrdup(optarg);
 			break;
-		case 'z':
-			remote_path = xstrdup(optarg);
-			break;
 		case 'v':
 			addargs(&args, "-v");
 			addargs(&remote_remote_args, "-v");
@@ -590,11 +623,45 @@ main(int argc, char **argv)
 			addargs(&remote_remote_args, "-q");
 			showprogress = 0;
 			break;
+#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 		case 'Z':
+			/* currently resume only works in SCP mode */
 			resume_flag = 1;
+			mode = MODE_SCP;
 			break;
+#endif
+		case 'X':
+			/* Please keep in sync with sftp.c -X */
+			if (strncmp(optarg, "buffer=", 7) == 0) {
+                                r = scan_scaled(optarg + 7, &llv);
+                                /* don't ask for a buffer larger than the maximum
+                                 * size that SFTP can handle */
+                                if (r == 0 && (llv <= 0 || llv > (SFTP_MAX_MSG_LENGTH - 1024))) {
+                                        r = -1;
+                                        errno = EINVAL;
+                                }
+                                if (r == -1) {
+                                        fatal("Invalid buffer size. Must be between 1B and 255KB."
+                                              "\"%s\": %s", optarg + 7, strerror(errno));
+                                }
+                                sftp_copy_buflen = (size_t)llv;
+                        } else if (strncmp(optarg, "nrequests=", 10) == 0) {
+                                /* more than 10k to 15k requests starts stalling the connection
+                                 * 8192 * default buffer size is 256MB of outstanding data.
+                                 * if users need more then they need to up the buffer size */
+                                llv = strtonum(optarg + 10, 1, 8 * 1024,
+                                               &errstr);
+                                if (errstr != NULL) {
+                                        fatal("Invalid number of requests. Must be between 1 and 8192. "
+                                              "\"%s\": %s", optarg + 10, errstr);
+                                }
+                                sftp_nrequests = (size_t)llv;
+                        } else {
+                                fatal("Invalid -X option");
+                        }
+                        break;
 
-		/* Server options. */
+			/* Server options. */
 		case 'd':
 			targetshouldbedirectory = 1;
 			break;
@@ -665,13 +732,10 @@ main(int argc, char **argv)
 	remin = remout = -1;
 	do_cmd_pid = -1;
 	/* Command to be executed on remote system using "ssh". */
-	/* the command uses the first scp in the users
-	 * path. This isn't necessarily going to be the 'right' scp to use.
-	 * So the current solution is to give the user the option of
-	 * entering the path to correct scp. If they don't then it defaults
-	 * to whatever scp is first in their path -cjr */
-	/* TODO: Rethink this in light renaming the binaries */
-	
+	/* In the event of an hpn to hpn connection the scp
+	 * command is rewritten to hpnscp. This happens in
+	 * clientloop.c -cjr 12/12/2022 */
+
 	(void) snprintf(cmd, sizeof cmd, "%s%s%s%s%s%s",
 			remote_path ? remote_path : "scp",
 			verbose_mode ? " -v" : "",
@@ -832,8 +896,13 @@ emit_expansion(const char *pattern, int brace_start, int brace_end,
     int sel_start, int sel_end, char ***patternsp, size_t *npatternsp)
 {
 	char *cp;
-	int o = 0, tail_len = strlen(pattern + brace_end + 1);
+	size_t pattern_len;
+	int o = 0, tail_len;
 
+	if ((pattern_len = strlen(pattern)) == 0 || pattern_len >= INT_MAX)
+		return -1;
+
+	tail_len = strlen(pattern + brace_end + 1);
 	if ((cp = malloc(brace_start + (sel_end - sel_start) +
 	    tail_len + 1)) == NULL)
 		return -1;
@@ -1017,7 +1086,8 @@ do_sftp_connect(char *host, char *user, int port, char *sftp_direct,
 		    reminp, remoutp, pidp) < 0)
 			return NULL;
 	}
-	return do_init(*reminp, *remoutp, 32768, 64, limit_kbps);
+	return sftp_init(*reminp, *remoutp,
+	    sftp_copy_buflen, sftp_nrequests, limit_kbps);
 }
 
 void
@@ -1029,6 +1099,7 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 	struct sftp_conn *conn = NULL, *conn2 = NULL;
 	arglist alist;
 	int i, r, status;
+	struct stat sb;
 	u_int j;
 
 	memset(&alist, '\0', sizeof(alist));
@@ -1171,6 +1242,11 @@ toremote(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 				errs = 1;
 		} else {	/* local to remote */
 			if (mode == MODE_SFTP) {
+				/* no need to glob: already done by shell */
+				if (stat(argv[i], &sb) != 0) {
+					fatal("stat local \"%s\": %s", argv[i],
+					    strerror(errno));
+				}
 				if (remin == -1) {
 					/* Connect to remote now */
 					conn = do_sftp_connect(thost, tuser,
@@ -1292,15 +1368,12 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 
 /* calculate the hash of a file up to length bytes
  * this is used to determine if remote and local file
- * fragments match. There may be a more efficient process for the hashing 
- * TODO: I'd like to XXHash for the hashing but that requires that both
- * ends have xxhash installed and then dealing with fallbacks */
+ * fragments match. There may be a more efficient process for the hashing
+ * Note: LibreSSL doesn't support blake2b512 so we can't offer them
+ * the resume feature cjr 7/18/2023 */
+#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 void calculate_hash(char *filename, char *output, off_t length)
 {
-#define HASH_LEN 128               /*40 sha1, 64 blake2s256 128 blake2b512*/
-#define BUF_AND_HASH HASH_LEN + 64 /* length of the hash and other data to get size of buffer */
-#define HASH_BUFLEN 8192	   /* 8192 seems to be a good balance between freads 
-				    * and the digest func*/
 	int n, md_len;
 	EVP_MD_CTX *c;
 	const EVP_MD *md;
@@ -1329,7 +1402,7 @@ void calculate_hash(char *filename, char *output, off_t length)
 
 	while (length > 0) {
 		if (length > HASH_BUFLEN)
-			/* fread returns the number of elements read. 
+			/* fread returns the number of elements read.
 			 * in this case 1. Multiply by the length to get the bytes */
 			bytes=fread(buf, HASH_BUFLEN, 1, file_ptr) * HASH_BUFLEN;
 		else
@@ -1349,6 +1422,12 @@ void calculate_hash(char *filename, char *output, off_t length)
 #endif
 	fclose(file_ptr);
 }
+#else
+void calculate_hash(char *filename, char *output, off_t length)
+{
+  /* empty function for builds without openssl or are using libressl */
+}
+#endif /* WITH_OPENSSL */
 
 #define TYPE_OVERFLOW(type, val) \
 	((sizeof(type) == 4 && (val) > INT32_MAX) || \
@@ -1371,8 +1450,8 @@ prepare_remote_path(struct sftp_conn *conn, const char *path)
 			return xstrdup(".");
 		return xstrdup(path + 2 + nslash);
 	}
-	if (can_expand_path(conn))
-		return do_expand_path(conn, path);
+	if (sftp_can_expand_path(conn))
+		return sftp_expand_path(conn, path);
 	/* No protocol extension */
 	error("server expand-path extension is required "
 	    "for ~user paths in SFTP mode");
@@ -1400,17 +1479,17 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 	 */
 	if ((target = prepare_remote_path(conn, targ)) == NULL)
 		cleanup_exit(255);
-	target_is_dir = remote_is_dir(conn, target);
+	target_is_dir = sftp_remote_is_dir(conn, target);
 	if (targetshouldbedirectory && !target_is_dir) {
 		debug("target directory \"%s\" does not exist", target);
 		a.flags = SSH2_FILEXFER_ATTR_PERMISSIONS;
 		a.perm = st.st_mode | 0700; /* ensure writable */
-		if (do_mkdir(conn, target, &a, 1) != 0)
+		if (sftp_mkdir(conn, target, &a, 1) != 0)
 			cleanup_exit(255); /* error already logged */
 		target_is_dir = 1;
 	}
 	if (target_is_dir)
-		abs_dst = path_append(target, filename);
+		abs_dst = sftp_path_append(target, filename);
 	else {
 		abs_dst = target;
 		target = NULL;
@@ -1418,12 +1497,12 @@ source_sftp(int argc, char *src, char *targ, struct sftp_conn *conn)
 	debug3_f("copying local %s to remote %s", src, abs_dst);
 
 	if (src_is_dir && iamrecursive) {
-		if (upload_dir(conn, src, abs_dst, pflag,
-		    SFTP_PROGRESS_ONLY, 0, 0, 1) != 0) {
+		if (sftp_upload_dir(conn, src, abs_dst, pflag,
+		    SFTP_PROGRESS_ONLY, 0, 0, 1, 1) != 0) {
 			error("failed to upload directory %s to %s", src, targ);
 			errs = 1;
 		}
-	} else if (do_upload(conn, src, abs_dst, pflag, 0, 0) != 0) {
+	} else if (sftp_upload(conn, src, abs_dst, pflag, 0, 0, 1) != 0) {
 		error("failed to upload file %s to %s", src, targ);
 		errs = 1;
 	}
@@ -1443,7 +1522,7 @@ source(int argc, char **argv)
 	int fd = -1, haderr, indx;
 	char *cp, *last, *name, buf[PATH_MAX + BUF_AND_HASH], encname[PATH_MAX];
 	int len;
-	char hashsum[HASH_LEN], test_hashsum[HASH_LEN];
+	char hashsum[HASH_LEN+1], test_hashsum[HASH_LEN+1];
 	char inbuf[PATH_MAX + BUF_AND_HASH];
 	size_t insize;
 	unsigned long long ull;
@@ -1755,13 +1834,28 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 	}
 
 	debug3_f("copying remote %s to local %s", abs_src, dst);
-	if ((r = remote_glob(conn, abs_src, GLOB_MARK, NULL, &g)) != 0) {
+	if ((r = sftp_glob(conn, abs_src, GLOB_NOCHECK|GLOB_MARK,
+	    NULL, &g)) != 0) {
 		if (r == GLOB_NOSPACE)
 			error("%s: too many glob matches", src);
 		else
 			error("%s: %s", src, strerror(ENOENT));
 		err = -1;
 		goto out;
+	}
+
+	/* Did we actually get any matches back from the glob? */
+	if (g.gl_matchc == 0 && g.gl_pathc == 1 && g.gl_pathv[0] != 0) {
+		/*
+		 * If nothing matched but a path returned, then it's probably
+		 * a GLOB_NOCHECK result. Check whether the unglobbed path
+		 * exists so we can give a nice error message early.
+		 */
+		if (sftp_stat(conn, g.gl_pathv[0], 1, NULL) != 0) {
+			error("%s: %s", src, strerror(ENOENT));
+			err = -1;
+			goto out;
+		}
 	}
 
 	if ((r = stat(dst, &st)) != 0)
@@ -1793,18 +1887,18 @@ sink_sftp(int argc, char *dst, const char *src, struct sftp_conn *conn)
 		}
 
 		if (dst_is_dir)
-			abs_dst = path_append(dst, filename);
+			abs_dst = sftp_path_append(dst, filename);
 		else
 			abs_dst = xstrdup(dst);
 
 		debug("Fetching %s to %s\n", g.gl_pathv[i], abs_dst);
-		if (globpath_is_dir(g.gl_pathv[i]) && iamrecursive) {
-			if (download_dir(conn, g.gl_pathv[i], abs_dst, NULL,
-			    pflag, SFTP_PROGRESS_ONLY, 0, 0, 1) == -1)
+		if (sftp_globpath_is_dir(g.gl_pathv[i]) && iamrecursive) {
+			if (sftp_download_dir(conn, g.gl_pathv[i], abs_dst,
+			    NULL, pflag, SFTP_PROGRESS_ONLY, 0, 0, 1, 1) == -1)
 				err = -1;
 		} else {
-			if (do_download(conn, g.gl_pathv[i], abs_dst, NULL,
-			    pflag, 0, 0) == -1)
+			if (sftp_download(conn, g.gl_pathv[i], abs_dst, NULL,
+			    pflag, 0, 0, 1) == -1)
 				err = -1;
 		}
 		free(abs_dst);
@@ -1851,17 +1945,17 @@ sink(int argc, char **argv, const char *src)
 	char outbuf[BUF_AND_HASH];
 	char match;
 	int bad_match_flag = 0;
-	np = '\0';
+	np = NULL; /* this was originally '/0' but that's wrong */
 	np_tmp = NULL;
-	
-	
+
+
 #define	atime	tv[0]
 #define	mtime	tv[1]
 #define	SCREWUP(str)	{ why = str; goto screwup; }
 
 #ifdef DEBUG
        fprintf (stderr, "%s: LOCAL In sink with %s\n", hostname, src);
-#endif	
+#endif
 	if (TYPE_OVERFLOW(time_t, 0) || TYPE_OVERFLOW(off_t, 0))
 		SCREWUP("Unexpected off_t/time_t size");
 
@@ -2059,11 +2153,20 @@ sink(int argc, char **argv, const char *src)
 #endif
 		if (npatterns > 0) {
 			for (n = 0; n < npatterns; n++) {
-				if (fnmatch(patterns[n], cp, 0) == 0)
+				if (strcmp(patterns[n], cp) == 0 ||
+				    fnmatch(patterns[n], cp, 0) == 0)
 					break;
 			}
-			if (n >= npatterns)
+			if (n >= npatterns) {
+				debug2_f("incoming filename \"%s\" does not "
+				    "match any of %zu expected patterns", cp,
+				    npatterns);
+				for (n = 0; n < npatterns; n++) {
+					debug3_f("expected pattern %zu: \"%s\"",
+					    n, patterns[n]);
+				}
 				SCREWUP("filename does not match request");
+			}
 		}
 		if (targisdir) {
 			static char *namebuf;
@@ -2508,7 +2611,7 @@ throughlocal_sftp(struct sftp_conn *from, struct sftp_conn *to,
 		cleanup_exit(255);
 	memset(&g, 0, sizeof(g));
 
-	targetisdir = remote_is_dir(to, target);
+	targetisdir = sftp_remote_is_dir(to, target);
 	if (!targetisdir && targetshouldbedirectory) {
 		error("%s: destination is not a directory", targ);
 		err = -1;
@@ -2516,13 +2619,28 @@ throughlocal_sftp(struct sftp_conn *from, struct sftp_conn *to,
 	}
 
 	debug3_f("copying remote %s to remote %s", abs_src, target);
-	if ((r = remote_glob(from, abs_src, GLOB_MARK, NULL, &g)) != 0) {
+	if ((r = sftp_glob(from, abs_src, GLOB_NOCHECK|GLOB_MARK,
+	    NULL, &g)) != 0) {
 		if (r == GLOB_NOSPACE)
 			error("%s: too many glob matches", src);
 		else
 			error("%s: %s", src, strerror(ENOENT));
 		err = -1;
 		goto out;
+	}
+
+	/* Did we actually get any matches back from the glob? */
+	if (g.gl_matchc == 0 && g.gl_pathc == 1 && g.gl_pathv[0] != 0) {
+		/*
+		 * If nothing matched but a path returned, then it's probably
+		 * a GLOB_NOCHECK result. Check whether the unglobbed path
+		 * exists so we can give a nice error message early.
+		 */
+		if (sftp_stat(from, g.gl_pathv[0], 1, NULL) != 0) {
+			error("%s: %s", src, strerror(ENOENT));
+			err = -1;
+			goto out;
+		}
 	}
 
 	for (i = 0; g.gl_pathv[i] && !interrupted; i++) {
@@ -2534,18 +2652,18 @@ throughlocal_sftp(struct sftp_conn *from, struct sftp_conn *to,
 		}
 
 		if (targetisdir)
-			abs_dst = path_append(target, filename);
+			abs_dst = sftp_path_append(target, filename);
 		else
 			abs_dst = xstrdup(target);
 
 		debug("Fetching %s to %s\n", g.gl_pathv[i], abs_dst);
-		if (globpath_is_dir(g.gl_pathv[i]) && iamrecursive) {
-			if (crossload_dir(from, to, g.gl_pathv[i], abs_dst,
+		if (sftp_globpath_is_dir(g.gl_pathv[i]) && iamrecursive) {
+			if (sftp_crossload_dir(from, to, g.gl_pathv[i], abs_dst,
 			    NULL, pflag, SFTP_PROGRESS_ONLY, 1) == -1)
 				err = -1;
 		} else {
-			if (do_crossload(from, to, g.gl_pathv[i], abs_dst, NULL,
-			    pflag) == -1)
+			if (sftp_crossload(from, to, g.gl_pathv[i], abs_dst,
+			    NULL, pflag) == -1)
 				err = -1;
 		}
 		free(abs_dst);
@@ -2606,12 +2724,21 @@ response(void)
 void
 usage(void)
 {
+#if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 	(void) fprintf(stderr,
 	    "usage: hpnscp [-346ABCOpqRrsTvZ] [-c cipher] [-D sftp_server_path] [-F ssh_config]\n"
+	    "              [-i identity_file] [-J destination] [-l limit] [-o ssh_option]\n"
+	    "              [-P port] [-S program] [-X sftp_option] source ... target\n");
+	exit(1);
+#else
+	(void) fprintf(stderr,
+	    "usage: hpnscp [-346ABCOpqRrsTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]\n"
 	    "              [-i identity_file] [-J destination] [-l limit]\n"
-	    "              [-o ssh_option] [-P port] [-z filepath of remote scp]" 
+	    "              [-o ssh_option] [-P port]"
 	    "              [-S program] source ... target\n");
 	exit(1);
+#endif
+
 }
 
 void
@@ -2774,8 +2901,8 @@ cleanup_exit(int i)
 	if (remout2 > 0)
 		close(remout2);
 	if (do_cmd_pid > 0)
-		waitpid(do_cmd_pid, NULL, 0);
+		(void)waitpid(do_cmd_pid, NULL, 0);
 	if (do_cmd_pid2 > 0)
-		waitpid(do_cmd_pid2, NULL, 0);
+		(void)waitpid(do_cmd_pid2, NULL, 0);
 	exit(i);
 }

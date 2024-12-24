@@ -1,8 +1,26 @@
+/*
+ * Copyright (c) 2022 The Board of Trustees of Carnegie Mellon University.
+ *
+ *  Author: Chris Rapier <rapier@psc.edu>
+ *
+ * This library is free software; you can redistribute it and/or modify it
+ * under the terms of the MIT License.
+ *
+ * This library is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the MIT License for more details.
+ *
+ * You should have received a copy of the MIT License along with this library;
+ * if not, see http://opensource.org/licenses/MIT.
+ *
+ */
+
 #include "includes.h"
 #include "metrics.h"
 #include "ssherr.h"
 #include <stdlib.h>
-#ifdef __linux__
+#include <stdio.h>
+#if defined(__linux__) && !defined(__alpine__)
 #include <linux/version.h>
 #endif
 
@@ -28,7 +46,7 @@ metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
  * on non linux systems we set the kernel version to 0
  * which will get us the base set of metrics from netinet/tcp.h
  */
-#ifdef __linux__
+#if (defined __linux__) && !defined(__alpine__)
 	binn_object_set_uint32(binnobj, "kernel_version", LINUX_VERSION_CODE);
 #else
 	binn_object_set_uint32(binnobj, "kernel_version", 0);
@@ -235,7 +253,7 @@ metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
  * the object will not necessarily have all of the elements. If it's empty it
  * current just spits out 0. This isn't optimal as 0 can also be a valid value */
 void
-metrics_read_binn_object (void *binnobj, char **output) {
+metrics_read_binn_object (void *binnobj, char *output) {
 	int len = 0;
 	int buflen = 1023;
 	int kernel_version = 0;
@@ -246,7 +264,7 @@ metrics_read_binn_object (void *binnobj, char **output) {
 	kernel_version = binn_object_uint32(binnobj, "kernel_version");
 
 	/* base set of metrics */
-	len = snprintf(*output, buflen, "%d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d",
+	len = snprintf(output, buflen, "%d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d",
 		       binn_object_uint8(binnobj, "tcpi_state"),
 		       binn_object_uint8(binnobj, "tcpi_ca_state"),
 		       binn_object_uint8(binnobj, "tcpi_retransmits"),
@@ -287,28 +305,28 @@ metrics_read_binn_object (void *binnobj, char **output) {
 	 * the remote kernel version. Only necessary under linux*/
 #ifdef __linux__
 	if (kernel_version >= KERNEL_VERSION(3,15,0)) {
-		len += snprintf(*output+len, (buflen-len), ", %llu, %llu",
+		len += snprintf(output+len, (buflen-len), ", %llu, %llu",
 				binn_object_uint64(binnobj, "tcpi_max_pacing_rate"),
 				binn_object_uint64(binnobj, "tcpi_pacing_rate")
 			);
 	}
 
 	if (kernel_version >= KERNEL_VERSION(4,1,0)) {
-		len += snprintf(*output+len, (buflen-len), ", %llu, %llu",
+		len += snprintf(output+len, (buflen-len), ", %llu, %llu",
 				binn_object_uint64(binnobj, "tcpi_bytes_acked"),
 				binn_object_uint64(binnobj, "tcpi_bytes_received")
 			);
 	}
 
 	if (kernel_version >= KERNEL_VERSION(4,2,0)) {
-		len += snprintf(*output+len, (buflen-len), ", %d, %d",
+		len += snprintf(output+len, (buflen-len), ", %d, %d",
 				binn_object_uint32(binnobj, "tcpi_segs_in"),
 				binn_object_uint32(binnobj, "tcpi_segs_out")
 			);
 	}
 
 	if (kernel_version >= KERNEL_VERSION(4,6,0)) {
-		len += snprintf(*output+len, (buflen-len), ", %d, %d, %d, %d",
+		len += snprintf(output+len, (buflen-len), ", %d, %d, %d, %d",
 				binn_object_uint32(binnobj, "tcpi_notsent_bytes"),
 				binn_object_uint32(binnobj, "tcpi_min_rtt"),
 				binn_object_uint32(binnobj, "tcpi_data_segs_in"),
@@ -317,14 +335,14 @@ metrics_read_binn_object (void *binnobj, char **output) {
 	}
 
 	if (kernel_version >= KERNEL_VERSION(4,9,0)) {
-		len += snprintf(*output+len, (buflen-len), ", %d, %llu",
+		len += snprintf(output+len, (buflen-len), ", %d, %llu",
 				binn_object_uint8(binnobj, "tcpi_delivery_rate_app_limited"),
 				binn_object_uint64(binnobj, "tcpi_delivery_rate")
 			);
 	}
 
 	if (kernel_version >= KERNEL_VERSION(4,10,0)) {
-		len += snprintf(*output+len, (buflen-len), ", %llu, %llu, %llu",
+		len += snprintf(output+len, (buflen-len), ", %llu, %llu, %llu",
 				binn_object_uint64(binnobj, "tcpi_busy_time"),
 				binn_object_uint64(binnobj, "tcpi_sndbuf_limited"),
 				binn_object_uint64(binnobj, "tcpi_rwnd_limited")
@@ -332,14 +350,14 @@ metrics_read_binn_object (void *binnobj, char **output) {
 	}
 
 	if (kernel_version >= KERNEL_VERSION(4,18,0)) {
-		len += snprintf(*output+len, (buflen-len), ", %d, %d",
+		len += snprintf(output+len, (buflen-len), ", %d, %d",
 				binn_object_uint32(binnobj, "tcpi_delivered"),
 				binn_object_uint32(binnobj, "tcpi_delivered_ce")
 			);
 	}
 
 	if (kernel_version >= KERNEL_VERSION(4,19,0)) {
-		len += snprintf(*output+len, (buflen-len), ", %llu, %llu, %d, %d",
+		len += snprintf(output+len, (buflen-len), ", %llu, %llu, %d, %d",
 				binn_object_uint64(binnobj, "tcpi_bytes_sent"),
 				binn_object_uint64(binnobj, "tcpi_bytes_retrans"),
 				binn_object_uint32(binnobj, "tcpi_dsack_dups"),
@@ -348,14 +366,14 @@ metrics_read_binn_object (void *binnobj, char **output) {
 	}
 
 	if (kernel_version >= KERNEL_VERSION(5,4,0)) {
-		len += snprintf(*output+len, (buflen-len), ", %d, %d",
+		len += snprintf(output+len, (buflen-len), ", %d, %d",
 				binn_object_uint32(binnobj, "tcpi_snd_wnd"),
 				binn_object_uint32(binnobj, "tcpi_rcv_ooopack")
 			);
 	}
 
 	if (kernel_version >= KERNEL_VERSION(5,5,0)) {
-		len += snprintf(*output+len, (buflen-len), ", %d",
+		len += snprintf(output+len, (buflen-len), ", %d",
 				binn_object_uint8(binnobj, "tcpi_fastopen_client_fail")
 			);
 	}

@@ -1,4 +1,4 @@
-/*	$OpenBSD: sshbuf.c,v 1.15 2020/02/26 13:40:09 jsg Exp $	*/
+/*	$OpenBSD: sshbuf.c,v 1.23 2024/08/14 15:42:18 tobias Exp $	*/
 /*
  * Copyright (c) 2011 Damien Miller
  *
@@ -15,7 +15,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#define SSHBUF_INTERNAL
 #include "includes.h"
 
 #include <sys/types.h>
@@ -25,11 +24,56 @@
 #include <string.h>
 
 #include "ssherr.h"
+#define SSHBUF_INTERNAL
 #include "sshbuf.h"
 #include "misc.h"
 /* #include "log.h" */
 
 #define BUF_WATERSHED 256*1024
+
+#ifdef SSHBUF_DEBUG
+# define SSHBUF_TELL(what) do { \
+		printf("%s:%d %s: %s size %zu alloc %zu off %zu max %zu\n", \
+		    __FILE__, __LINE__, __func__, what, \
+		    buf->size, buf->alloc, buf->off, buf->max_size); \
+		fflush(stdout); \
+	} while (0)
+#else
+# define SSHBUF_TELL(what)
+#endif
+
+struct sshbuf {
+	u_char *d;		/* Data */
+	const u_char *cd;	/* Const data */
+	size_t off;		/* First available byte is buf->d + buf->off */
+	size_t size;		/* Last byte is buf->d + buf->size - 1 */
+	size_t max_size;	/* Maximum size of buffer */
+	size_t alloc;		/* Total bytes allocated to buf->d */
+	int readonly;		/* Refers to external, const data */
+	u_int refcount;		/* Tracks self and number of child buffers */
+	struct sshbuf *parent;	/* If child, pointer to parent */
+	char label[MAX_LABEL_LEN];   /* String for buffer label - debugging use */
+	int type;               /* type of buffer enum (sshbuf_types)*/
+};
+
+/* update the label string for a given sshbuf. Useful
+ * for debugging */
+void
+sshbuf_relabel(struct sshbuf *buf, const char *label)
+{
+	if (label != NULL)
+		strncpy(buf->label, label, MAX_LABEL_LEN-1);
+}
+
+/* set the type (from enum sshbuf_type) of the given sshbuf.
+ * The purpose is to allow different classes of buffers to
+ * follow different code paths if necessary */
+void
+sshbuf_type(struct sshbuf *buf, int type)
+{
+	if (type < BUF_MAX_TYPE)
+		buf->type = type;
+}
 
 static inline int
 sshbuf_check_sanity(const struct sshbuf *buf)
@@ -37,6 +81,7 @@ sshbuf_check_sanity(const struct sshbuf *buf)
 	SSHBUF_TELL("sanity");
 	if (__predict_false(buf == NULL ||
 	    (!buf->readonly && buf->d != buf->cd) ||
+	    buf->parent == buf ||
 	    buf->refcount < 1 || buf->refcount > SSHBUF_REFS_MAX ||
 	    buf->cd == NULL ||
 	    buf->max_size > SSHBUF_SIZE_MAX ||
@@ -69,17 +114,19 @@ sshbuf_maybe_pack(struct sshbuf *buf, int force)
 }
 
 struct sshbuf *
-sshbuf_new(void)
+sshbuf_new_label (const char *label)
 {
 	struct sshbuf *ret;
 
-	if ((ret = calloc(sizeof(*ret), 1)) == NULL)
+	if ((ret = calloc(1, sizeof(*ret))) == NULL)
 		return NULL;
 	ret->alloc = SSHBUF_SIZE_INIT;
 	ret->max_size = SSHBUF_SIZE_MAX;
 	ret->readonly = 0;
 	ret->refcount = 1;
 	ret->parent = NULL;
+	if (label != NULL)
+		strncpy(ret->label, label, MAX_LABEL_LEN-1);
 	if ((ret->cd = ret->d = calloc(1, ret->alloc)) == NULL) {
 		free(ret);
 		return NULL;
@@ -93,7 +140,7 @@ sshbuf_from(const void *blob, size_t len)
 	struct sshbuf *ret;
 
 	if (blob == NULL || len > SSHBUF_SIZE_MAX ||
-	    (ret = calloc(sizeof(*ret), 1)) == NULL)
+	    (ret = calloc(1, sizeof(*ret))) == NULL)
 		return NULL;
 	ret->alloc = ret->size = ret->max_size = len;
 	ret->readonly = 1;
@@ -112,6 +159,9 @@ sshbuf_set_parent(struct sshbuf *child, struct sshbuf *parent)
 	if ((r = sshbuf_check_sanity(child)) != 0 ||
 	    (r = sshbuf_check_sanity(parent)) != 0)
 		return r;
+	if ((child->parent != NULL && child->parent != parent) ||
+	    child == parent)
+		return SSH_ERR_INTERNAL_ERROR;
 	child->parent = parent;
 	child->parent->refcount++;
 	return 0;
@@ -157,16 +207,14 @@ sshbuf_free(struct sshbuf *buf)
 		return;
 
 	/*
-	 * If we are a child, the free our parent to decrement its reference
+	 * If we are a child, then free our parent to decrement its reference
 	 * count and possibly free it.
 	 */
 	sshbuf_free(buf->parent);
 	buf->parent = NULL;
 
-	if (!buf->readonly) {
-		explicit_bzero(buf->d, buf->alloc);
-		free(buf->d);
-	}
+	if (!buf->readonly)
+		freezero(buf->d, buf->alloc);
 	freezero(buf, sizeof(*buf));
 }
 
@@ -180,7 +228,8 @@ sshbuf_reset(struct sshbuf *buf)
 		buf->off = buf->size;
 		return;
 	}
-	(void) sshbuf_check_sanity(buf);
+	if (sshbuf_check_sanity(buf) != 0)
+		return;
 	buf->off = buf->size = 0;
 	if (buf->alloc != SSHBUF_SIZE_INIT) {
 		if ((d = recallocarray(buf->d, buf->alloc, SSHBUF_SIZE_INIT,
@@ -189,7 +238,7 @@ sshbuf_reset(struct sshbuf *buf)
 			buf->alloc = SSHBUF_SIZE_INIT;
 		}
 	}
-	explicit_bzero(buf->d, SSHBUF_SIZE_INIT);
+	explicit_bzero(buf->d, buf->alloc);
 }
 
 size_t
@@ -267,7 +316,18 @@ sshbuf_avail(const struct sshbuf *buf)
 {
 	if (sshbuf_check_sanity(buf) != 0 || buf->readonly || buf->refcount > 1)
 		return 0;
-	return buf->max_size - (buf->size - buf->off);
+	/* we need to reserve a small amount of overhead on the input buffer
+	 * or we can enter into a pathological state during bulk
+	 * data transfers. We use a fraction of the max size as we want it to scale
+	 * with the size of the input buffer. If we do it for all of the buffers
+	 * we fail the regression unit tests. This seems like a reasonable
+	 * solution. Of course, I still need to figure out *why* this is
+	 * happening and come up with an actual fix. TODO
+	 * cjr 4/19/2024 */
+	if (buf->type == BUF_CHANNEL_INPUT)
+		return buf->max_size / 1.05 - (buf->size - buf->off);
+	else
+		return buf->max_size - (buf->size - buf->off);
 }
 
 const u_char *
@@ -331,36 +391,32 @@ sshbuf_allocate(struct sshbuf *buf, size_t len)
 	 * slowly. It's knows that it needs to grow but it only does so 32K
 	 * at a time. This means a lot of calls to realloc and memcpy which
 	 * kills performance until the buffer reaches some maximum size.
-	 * so we explicitly test for a buffer that's trying to grow and
-	 * if it is then we push the growth to whatever the adjusted value of
-	 * local_window_max happens to be. This significantly reduces overhead
+	 * So we explicitly test for a buffer that's trying to grow and
+	 * if it is then we push the growth by 4MB at a time. This can result in
+	 * the buffer being over allocated (in terms of actual needs) but the
+	 * process is fast. This significantly reduces overhead
 	 * and improves performance. In this case we look for a buffer that is trying
 	 * to grow larger than BUF_WATERSHED (256*1024 taken from PACKET_MAX_SIZE)
-	 * and where the local_window_max isn't zero (which is usally in the Channels
-	 * struct but we copied it into the shhbuf as window_max). If it is zero or
-	 * the buffer is smaller than BUF_WATERSHED we just use the
-	 * normal value for need. We also don't want to grow the buffer past
-	 * what we need (the size of window_max) so if the current allocation (in
-	 * buf->alloc) is greater than window_max we skip it.
+	 * and explcitly check that the buffer is being used for inbound outbound
+	 * channel buffering.
+	 * Updated for 18.4.1 -cjr 04/20/24
 	 */
-	if (rlen > BUF_WATERSHED && buf->window_max !=0 && buf->alloc < buf->window_max) {
-		// debug("*********** prior rlen %zu and need %zu buf_alloc is %zu", rlen, need, buf->alloc);
-		/* set need to the the max window size less the current allocation */
-		need = buf->window_max;
+	if (rlen > BUF_WATERSHED && (buf->type == BUF_CHANNEL_OUTPUT || buf->type == BUF_CHANNEL_INPUT)) {
+		/* debug_f ("Prior: label: %s, %p, rlen is %zu need is %zu max_size is %zu",
+		   buf->label, buf, rlen, need, buf->max_size); */
+		/* easiest thing to do is grow the nuffer by 4MB each time. It might end
+		 * up being somewhat overallocated but works quickly */
+		need = (4*1024*1024);
 		rlen = ROUNDUP(buf->alloc + need, SSHBUF_SIZE_INC);
-		/* in some cases, like a very high rtt with a large receive buffer
-		 * rlen can exceed buf->max size. So clamp it if necessary */
-		if (rlen > buf->max_size)
-			rlen = buf->max_size;
-		//debug ("***********************************  rlen is %zu need is %zu window max is %zu max_size is %zu", rlen, need, buf->window_max, buf->max_size);
+		/* debug_f ("Post: label: %s, %p, rlen is %zu need is %zu max_size is %zu", */
+		/* 	 buf->label, buf, rlen, need, buf->max_size); */
 	}
 	SSHBUF_DBG(("need %zu initial rlen %zu", need, rlen));
+
+	/* rlen might be above the max allocation */
 	if (rlen > buf->max_size)
-		rlen = buf->alloc + need;
-	/* be sure to include log.h if you uncomment the debug
-	 * this debug helped identify the buffer growth issue in v8.9
-	 * see the git log about it. search for sshbuf_read -cjr */
-	/* debug("adjusted rlen: %zu, len: %lu for %p", rlen, len, buf); */
+		rlen = buf->max_size;
+
 	SSHBUF_DBG(("adjusted rlen %zu", rlen));
 	if ((dp = recallocarray(buf->d, buf->alloc, rlen, 1)) == NULL) {
 		SSHBUF_DBG(("realloc fail"));

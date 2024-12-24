@@ -1,4 +1,4 @@
-/* $OpenBSD: readpass.c,v 1.69 2021/07/23 05:56:47 djm Exp $ */
+/* $OpenBSD: readpass.c,v 1.71 2024/03/30 04:27:44 djm Exp $ */
 /*
  * Copyright (c) 2001 Markus Friedl.  All rights reserved.
  *
@@ -127,8 +127,9 @@ read_passphrase(const char *prompt, int flags)
 	const char *askpass_hint = NULL;
 	const char *s;
 
-	if ((s = getenv("DISPLAY")) != NULL)
-		allow_askpass = *s != '\0';
+	if (((s = getenv("DISPLAY")) != NULL && *s != '\0') ||
+	    ((s = getenv("WAYLAND_DISPLAY")) != NULL && *s != '\0'))
+		allow_askpass = 1;
 	if ((s = getenv(SSH_ASKPASS_REQUIRE_ENV)) != NULL) {
 		if (strcasecmp(s, "force") == 0) {
 			use_askpass = 1;
@@ -261,7 +262,7 @@ notify_start(int force_askpass, const char *fmt, ...)
 		debug3_f("cannot notify: no askpass");
 		goto out;
 	}
-	if (getenv("DISPLAY") == NULL &&
+	if (getenv("DISPLAY") == NULL && getenv("WAYLAND_DISPLAY") == NULL &&
 	    ((s = getenv(SSH_ASKPASS_REQUIRE_ENV)) == NULL ||
 	    strcmp(s, "force") != 0)) {
 		debug3_f("cannot notify: no display");
@@ -286,7 +287,8 @@ notify_start(int force_askpass, const char *fmt, ...)
 	}
  out_ctx:
 	if ((ret = calloc(1, sizeof(*ret))) == NULL) {
-		kill(pid, SIGTERM);
+		if (pid != -1)
+			kill(pid, SIGTERM);
 		fatal_f("calloc failed");
 	}
 	ret->pid = pid;

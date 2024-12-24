@@ -1,4 +1,4 @@
-/* $OpenBSD: sshconnect.c,v 1.356 2021/12/19 22:10:24 djm Exp $ */
+/* $OpenBSD: sshconnect.c,v 1.368 2024/04/30 02:10:49 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -54,10 +54,10 @@
 #include "ssh.h"
 #include "sshbuf.h"
 #include "packet.h"
-#include "compat.h"
 #include "sshkey.h"
 #include "sshconnect.h"
 #include "log.h"
+#include "match.h"
 #include "misc.h"
 #include "readconf.h"
 #include "atomicio.h"
@@ -345,30 +345,6 @@ check_ifaddrs(const char *ifname, int af, const struct ifaddrs *ifaddrs,
 #endif
 
 /*
- * Set TCP receive buffer if requested.
- * Note: tuning needs to happen after the socket is
- * created but before the connection happens
- * so winscale is negotiated properly -cjr
- */
-static void
-ssh_set_socket_recvbuf(int sock)
-{
-	void *buf = (void *)&options.tcp_rcv_buf;
-	int sz = sizeof(options.tcp_rcv_buf);
-	int socksize;
-	int socksizelen = sizeof(int);
-
-	debug("setsockopt Attempting to set SO_RCVBUF to %d", options.tcp_rcv_buf);
-	if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, buf, sz) >= 0) {
-	  getsockopt(sock, SOL_SOCKET, SO_RCVBUF, &socksize, &socksizelen);
-	  debug("setsockopt SO_RCVBUF: %.100s %d", strerror(errno), socksize);
-	}
-	else
-		error("Couldn't set socket receive buffer to %d: %.100s",
-		    options.tcp_rcv_buf, strerror(errno));
-}
-
-/*
  * Creates a socket for use as the ssh connection.
  */
 static int
@@ -388,10 +364,7 @@ ssh_create_socket(struct addrinfo *ai)
 		error("socket: %s", strerror(errno));
 		return -1;
 	}
-	fcntl(sock, F_SETFD, FD_CLOEXEC);
-
-	if (options.tcp_rcv_buf > 0)
-		ssh_set_socket_recvbuf(sock);
+	(void)fcntl(sock, F_SETFD, FD_CLOEXEC);
 
 	/* Use interactive QOS (if specified) until authentication completed */
 	if (options.ip_qos_interactive != INT_MAX)
@@ -509,6 +482,14 @@ ssh_connect_direct(struct ssh *ssh, const char *host, struct addrinfo *aitop,
 				errno = oerrno;
 				continue;
 			}
+			if (options.address_family != AF_UNSPEC &&
+			    ai->ai_family != options.address_family) {
+				debug2_f("skipping address [%s]:%s: "
+				    "wrong address family", ntop, strport);
+				errno = EAFNOSUPPORT;
+				continue;
+			}
+
 			debug("Connecting to %.200s [%.100s] port %s.",
 				host, ntop, strport);
 
@@ -667,7 +648,7 @@ get_hostfile_hostname_ipaddr(char *hostname, struct sockaddr *hostaddr,
 		if (options.proxy_command == NULL) {
 			if (getnameinfo(hostaddr, addrlen,
 			    ntop, sizeof(ntop), NULL, 0, NI_NUMERICHOST) != 0)
-			fatal_f("getnameinfo failed");
+				fatal_f("getnameinfo failed");
 			*hostfile_ipaddr = put_host_port(ntop, port);
 		} else {
 			*hostfile_ipaddr = xstrdup("<no hostip for proxy "
@@ -735,6 +716,29 @@ try_tilde_unexpand(const char *path)
 		l++;
 	xasprintf(&ret, "~/%s", path + l);
 	return ret;
+}
+
+/*
+ * Returns non-zero if the key is accepted by HostkeyAlgorithms.
+ * Made slightly less trivial by the multiple RSA signature algorithm names.
+ */
+int
+hostkey_accepted_by_hostkeyalgs(const struct sshkey *key)
+{
+	const char *ktype = sshkey_ssh_name(key);
+	const char *hostkeyalgs = options.hostkeyalgorithms;
+
+	if (key->type == KEY_UNSPEC)
+		return 0;
+	if (key->type == KEY_RSA &&
+	    (match_pattern_list("rsa-sha2-256", hostkeyalgs, 0) == 1 ||
+	    match_pattern_list("rsa-sha2-512", hostkeyalgs, 0) == 1))
+		return 1;
+	if (key->type == KEY_RSA_CERT &&
+	    (match_pattern_list("rsa-sha2-512-cert-v01@openssh.com", hostkeyalgs, 0) == 1 ||
+	    match_pattern_list("rsa-sha2-256-cert-v01@openssh.com", hostkeyalgs, 0) == 1))
+		return 1;
+	return match_pattern_list(ktype, hostkeyalgs, 0) == 1;
 }
 
 static int
@@ -843,7 +847,7 @@ other_hostkeys_message(const char *host, const char *ip,
 	    system_hostfiles, num_system_hostfiles,
 	    &othernames, &num_othernames);
 	if (num_othernames == 0)
-		return xstrdup("This key is not known by any other names");
+		return xstrdup("This key is not known by any other names.");
 
 	xasprintf(&ret, "This host key is known by the following other "
 	    "names/addresses:");
@@ -962,7 +966,7 @@ check_host_key(char *hostname, const struct ssh_conn_info *cinfo,
 	char *ip = NULL, *host = NULL;
 	char hostline[1000], *hostp, *fp, *ra;
 	char msg[1024];
-	const char *type, *fail_reason;
+	const char *type, *fail_reason = NULL;
 	const struct hostkey_entry *host_found = NULL, *ip_found = NULL;
 	int len, cancelled_forwarding = 0, confirmed;
 	int local = sockaddr_is_local(hostaddr);
@@ -985,6 +989,17 @@ check_host_key(char *hostname, const struct ssh_conn_info *cinfo,
 		    "loopback/localhost.");
 		options.update_hostkeys = 0;
 		return 0;
+	}
+
+	/*
+	 * Don't ever try to write an invalid name to a known hosts file.
+	 * Note: do this before get_hostfile_hostname_ipaddr() to catch
+	 * '[' or ']' in the name before they are added.
+	 */
+	if (strcspn(hostname, "@?*#[]|'\'\"\\") != strlen(hostname)) {
+		debug_f("invalid hostname \"%s\"; will not record: %s",
+		    hostname, fail_reason);
+		readonly = RDONLY;
 	}
 
 	/*
@@ -1026,6 +1041,12 @@ check_host_key(char *hostname, const struct ssh_conn_info *cinfo,
 	}
 
  retry:
+	if (!hostkey_accepted_by_hostkeyalgs(host_key)) {
+		error("host key %s not permitted by HostkeyAlgorithms",
+		    sshkey_ssh_name(host_key));
+		goto fail;
+	}
+
 	/* Reload these as they may have changed on cert->key downgrade */
 	want_cert = sshkey_is_cert(host_key);
 	type = sshkey_type(host_key);
@@ -1292,8 +1313,11 @@ check_host_key(char *hostname, const struct ssh_conn_info *cinfo,
 		}
 		/* The host key has changed. */
 		warn_changed_key(host_key);
-		error("Add correct host key in %.100s to get rid of this message.",
-		    user_hostfiles[0]);
+		if (num_user_hostfiles > 0 || num_system_hostfiles > 0) {
+			error("Add correct host key in %.100s to get rid "
+			    "of this message.", num_user_hostfiles > 0 ?
+			    user_hostfiles[0] : system_hostfiles[0]);
+		}
 		error("Offending %s key in %s:%lu",
 		    sshkey_type(host_found->key),
 		    host_found->file, host_found->line);
@@ -1361,7 +1385,7 @@ check_host_key(char *hostname, const struct ssh_conn_info *cinfo,
 		if (options.exit_on_forward_failure && cancelled_forwarding)
 			fatal("Error: forwarding disabled due to host key "
 			    "check failure");
-		
+
 		/*
 		 * XXX Should permit the user to change to use the new id.
 		 * This could be done by converting the host key to an
@@ -1601,7 +1625,9 @@ show_other_keys(struct hostkeys *hostkeys, struct sshkey *key)
 {
 	int type[] = {
 		KEY_RSA,
+#ifdef WITH_DSA
 		KEY_DSA,
+#endif
 		KEY_ECDSA,
 		KEY_ED25519,
 		KEY_XMSS,

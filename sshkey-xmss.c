@@ -1,4 +1,4 @@
-/* $OpenBSD: sshkey-xmss.c,v 1.11 2021/04/03 06:18:41 djm Exp $ */
+/* $OpenBSD: sshkey-xmss.c,v 1.12 2022/10/28 00:39:29 djm Exp $ */
 /*
  * Copyright (c) 2017 Markus Friedl.  All rights reserved.
  *
@@ -365,7 +365,7 @@ sshkey_xmss_deserialize_pk_info(struct sshkey *k, struct sshbuf *b)
 }
 
 int
-sshkey_xmss_generate_private_key(struct sshkey *k, u_int bits)
+sshkey_xmss_generate_private_key(struct sshkey *k, int bits)
 {
 	int r;
 	const char *name;
@@ -903,9 +903,29 @@ sshkey_xmss_encrypt_state(const struct sshkey *k, struct sshbuf *b,
 	    state->enc_keyiv == NULL ||
 	    state->enc_ciphername == NULL)
 		return SSH_ERR_INTERNAL_ERROR;
-	if ((cipher = cipher_by_name(state->enc_ciphername)) == NULL) {
-		r = SSH_ERR_INTERNAL_ERROR;
-		goto out;
+	/*
+	 * chacha20-poly1305-mt@hpnssh.org and chacha20-poly1305@openssh.com
+	 * represent different implementations of the same cipher. For key
+	 * encryption purposes, they're equivalent, and the multithreaded
+	 * implementation is excessive. It can be assumed that references to the
+	 * multithreaded implementation in this context are unintentional, so
+	 * these checks should look for the serial implementation instead.
+	 *
+	 * Additionally, the following code is safe regardless of whether the
+	 * multithreaded implementation is enabled, so no #ifdefs are necessary.
+	 */
+	if (strcmp(state->enc_ciphername, "chacha20-poly1305-mt@hpnssh.org")
+	    == 0) {
+		if ((cipher = cipher_by_name("chacha20-poly1305@openssh.com"))
+		    == NULL) {
+			r = SSH_ERR_INTERNAL_ERROR;
+			goto out;
+		}
+	} else {
+		if ((cipher = cipher_by_name(state->enc_ciphername)) == NULL) {
+			r = SSH_ERR_INTERNAL_ERROR;
+			goto out;
+		}
 	}
 	blocksize = cipher_blocksize(cipher);
 	keylen = cipher_keylen(cipher);
@@ -955,8 +975,8 @@ sshkey_xmss_encrypt_state(const struct sshkey *k, struct sshbuf *b,
 	/* encrypt at offset addlen */
 	if ((r = sshbuf_reserve(encrypted,
 	    encrypted_len + aadlen + authlen, &cp)) != 0 ||
-	    (r = cipher_init(&ciphercontext, cipher, key, keylen,
-	    iv, ivlen, 1)) != 0 ||
+	    (r = cipher_init(&ciphercontext, cipher, key, keylen, iv, ivlen, 0,
+	        CIPHER_ENCRYPT, CIPHER_SERIAL)) != 0 ||
 	    (r = cipher_crypt(ciphercontext, 0, cp, sshbuf_ptr(encoded),
 	    encrypted_len, aadlen, authlen)) != 0)
 		goto out;
@@ -995,9 +1015,29 @@ sshkey_xmss_decrypt_state(const struct sshkey *k, struct sshbuf *encoded,
 	    state->enc_keyiv == NULL ||
 	    state->enc_ciphername == NULL)
 		return SSH_ERR_INTERNAL_ERROR;
-	if ((cipher = cipher_by_name(state->enc_ciphername)) == NULL) {
-		r = SSH_ERR_INVALID_FORMAT;
-		goto out;
+	/*
+	 * chacha20-poly1305-mt@hpnssh.org and chacha20-poly1305@openssh.com
+	 * represent different implementations of the same cipher. For key
+	 * encryption purposes, they're equivalent, and the multithreaded
+	 * implementation is excessive. It can be assumed that references to the
+	 * multithreaded implementation in this context are unintentional, so
+	 * these checks should look for the serial implementation instead.
+	 *
+	 * Additionally, the following code is safe regardless of whether the
+	 * multithreaded implementation is enabled, so no #ifdefs are necessary.
+	 */
+	if (strcmp(state->enc_ciphername, "chacha20-poly1305-mt@hpnssh.org")
+	    == 0) {
+		if ((cipher = cipher_by_name("chacha20-poly1305@openssh.com"))
+		    == NULL) {
+			r = SSH_ERR_INVALID_FORMAT;
+			goto out;
+		}
+	} else {
+		if ((cipher = cipher_by_name(state->enc_ciphername)) == NULL) {
+			r = SSH_ERR_INVALID_FORMAT;
+			goto out;
+		}
 	}
 	blocksize = cipher_blocksize(cipher);
 	keylen = cipher_keylen(cipher);
@@ -1048,8 +1088,8 @@ sshkey_xmss_decrypt_state(const struct sshkey *k, struct sshbuf *encoded,
 
 	/* decrypt private state of key */
 	if ((r = sshbuf_reserve(decrypted, aadlen + encrypted_len, &dp)) != 0 ||
-	    (r = cipher_init(&ciphercontext, cipher, key, keylen,
-	    iv, ivlen, 0)) != 0 ||
+	    (r = cipher_init(&ciphercontext, cipher, key, keylen, iv, ivlen, 0,
+	        CIPHER_DECRYPT, CIPHER_SERIAL)) != 0 ||
 	    (r = cipher_crypt(ciphercontext, 0, dp, sshbuf_ptr(copy),
 	    encrypted_len, aadlen, authlen)) != 0)
 		goto out;

@@ -33,9 +33,9 @@
 .\" (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 .\" THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 .\"
-.\" $OpenBSD: sshd_config.5,v 1.340 2022/03/31 17:58:44 naddy Exp $
-.Dd $Mdocdate: March 31 2022 $
-.Dt HPSSHD_CONFIG 5
+.\" $OpenBSD: sshd_config.5,v 1.374 2024/09/15 08:27:38 jmc Exp $
+.Dd $Mdocdate: September 15 2024 $
+.Dt HPNSSHD_CONFIG 5
 .Os
 .Sh NAME
 .Nm hpnsshd_config
@@ -48,7 +48,7 @@ reads configuration data from
 .Fl f
 on the command line).
 The file contains keyword-argument pairs, one per line.
-For each keyword, the first obtained value will be used.
+Unless noted otherwise, for each keyword, the first obtained value will be used.
 Lines starting with
 .Ql #
 and empty lines are interpreted as comments.
@@ -130,6 +130,9 @@ The allow/deny groups directives are processed in the following order:
 See PATTERNS in
 .Xr ssh_config 5
 for more information on patterns.
+This keyword may appear multiple times in
+.Nm
+with each instance appending to the list.
 .It Cm AllowStreamLocalForwarding
 Specifies whether StreamLocal (Unix-domain socket) forwarding is permitted.
 The available options are
@@ -187,6 +190,9 @@ The allow/deny users directives are processed in the following order:
 See PATTERNS in
 .Xr ssh_config 5
 for more information on patterns.
+This keyword may appear multiple times in
+.Nm
+with each instance appending to the list.
 .It Cm AuthenticationMethods
 Specifies the authentication methods that must be successfully completed
 for a user to be granted access.
@@ -405,6 +411,83 @@ from the default set instead of replacing them.
 .Pp
 Certificates signed using other algorithms will not be accepted for
 public key or host-based authentication.
+.It Cm ChannelTimeout
+Specifies whether and how quickly
+.Xr sshd 8
+should close inactive channels.
+Timeouts are specified as one or more
+.Dq type=interval
+pairs separated by whitespace, where the
+.Dq type
+must be the special keyword
+.Dq global
+or a channel type name from the list below, optionally containing
+wildcard characters.
+.Pp
+The timeout value
+.Dq interval
+is specified in seconds or may use any of the units documented in the
+.Sx TIME FORMATS
+section.
+For example,
+.Dq session=5m
+would cause interactive sessions to terminate after five minutes of
+inactivity.
+Specifying a zero value disables the inactivity timeout.
+.Pp
+The special timeout
+.Dq global
+applies to all active channels, taken together.
+Traffic on any active channel will reset the timeout, but when the timeout
+expires then all open channels will be closed.
+Note that this global timeout is not matched by wildcards and must be
+specified explicitly.
+.Pp
+The available channel type names include:
+.Bl -tag -width Ds
+.It Cm agent-connection
+Open connections to
+.Xr ssh-agent 1 .
+.It Cm direct-tcpip , Cm direct-streamlocal@openssh.com
+Open TCP or Unix socket (respectively) connections that have
+been established from a
+.Xr ssh 1
+local forwarding, i.e.\&
+.Cm LocalForward
+or
+.Cm DynamicForward .
+.It Cm forwarded-tcpip , Cm forwarded-streamlocal@openssh.com
+Open TCP or Unix socket (respectively) connections that have been
+established to a
+.Xr sshd 8
+listening on behalf of a
+.Xr ssh 1
+remote forwarding, i.e.\&
+.Cm RemoteForward .
+.It Cm session
+The interactive main session, including shell session, command execution,
+.Xr scp 1 ,
+.Xr sftp 1 ,
+etc.
+.It Cm tun-connection
+Open
+.Cm TunnelForward
+connections.
+.It Cm x11-connection
+Open X11 forwarding sessions.
+.El
+.Pp
+Note that in all the above cases, terminating an inactive session does not
+guarantee to remove all resources associated with the session, e.g. shell
+processes or X11 clients relating to the session may continue to execute.
+.Pp
+Moreover, terminating an inactive channel or session does not necessarily
+close the SSH connection, nor does it prevent a client from
+requesting another channel of the same type.
+In particular, expiring an inactive forwarding session does not prevent
+another identical forwarding from being subsequently created.
+.Pp
+The default is not to expire channels of any type for inactivity.
 .It Cm ChrootDirectory
 Specifies the pathname of a directory to
 .Xr chroot 2
@@ -412,7 +495,7 @@ to after authentication.
 At session startup
 .Xr sshd 8
 checks that all components of the pathname are root-owned directories
-which are not writable by any other user or group.
+which are not writable by group or others.
 After the chroot,
 .Xr sshd 8
 changes the working directory to the user's home directory.
@@ -570,6 +653,9 @@ The allow/deny groups directives are processed in the following order:
 See PATTERNS in
 .Xr ssh_config 5
 for more information on patterns.
+This keyword may appear multiple times in
+.Nm
+with each instance appending to the list.
 .It Cm DenyUsers
 This keyword can be followed by a list of user name patterns, separated
 by spaces.
@@ -588,6 +674,9 @@ The allow/deny users directives are processed in the following order:
 See PATTERNS in
 .Xr ssh_config 5
 for more information on patterns.
+This keyword may appear multiple times in
+.Nm
+with each instance appending to the list.
 .It Cm DisableForwarding
 Disables all forwarding features, including X11,
 .Xr ssh-agent 1 ,
@@ -801,23 +890,6 @@ In some situations, such as transfers on a local area network, the impact
 of the HPN code produces a net decrease in performance. In these cases it is
 helpful to disable the HPN functionality. By default HPNDisabled is set to 
 .CM no.
-.It Cm HPNBufferLimit
-This option will force the hpnssh receive buffer to grow more slowly and limits
-the growth to one half of the TCP receive buffer. This option can prove useful
-in situation where a high speed path with larger RTTs are writing to a slower
-device or file system. Enabling this option will reduce performance but may provide
-a more stable connection. The option only impacts the receiving side of the connection. 
-For example, a client receiving data from a server but not a client sending data. If 
-enabled on a server this will impact all incoming connections. 
-By default this option is set to 
-.Cm no. HPNSSH only.
-.It Cm HPNBufferSize
-This is the default buffer size, in kilobytes, that HPN functionality uses when interacting
-with nonHPN SSH installations. Conceptually this is similar to the TcpRcvBuf
-option as applied to the internal SSH flow control. This value can range from
-1KB to 64MB (1-65536). Use of oversized or undersized buffers can cause performance
-problems depending on the length of the network path. The default size of this buffer
-is 2MB.
 .It Cm IgnoreRhosts
 Specifies whether to ignore per-user
 .Pa .rhosts
@@ -853,7 +925,7 @@ should ignore the user's
 during
 .Cm HostbasedAuthentication
 and use only the system-wide known hosts file
-.Pa /etc/hpnssh/known_hosts .
+.Pa /etc/hpnssh/ssh_known_hosts .
 The default is
 .Dq no .
 .It Cm Include
@@ -950,9 +1022,13 @@ file on logout.
 The default is
 .Cm yes .
 .It Cm KexAlgorithms
-Specifies the available KEX (Key Exchange) algorithms.
+Specifies the permitted KEX (Key Exchange) algorithms that the server will
+offer to clients.
+The ordering of this list is not important, as the client specifies the
+preference order.
 Multiple algorithms must be comma-separated.
-Alternately if the specified list begins with a
+.Pp
+If the specified list begins with a
 .Sq +
 character, then the specified algorithms will be appended to the default set
 instead of replacing them.
@@ -964,6 +1040,7 @@ If the specified list begins with a
 .Sq ^
 character, then the specified algorithms will be placed at the head of the
 default set.
+.Pp
 The supported algorithms are:
 .Pp
 .Bl -item -compact -offset indent
@@ -992,12 +1069,17 @@ ecdh-sha2-nistp384
 .It
 ecdh-sha2-nistp521
 .It
+mlkem768x25519-sha256
+.It
+sntrup761x25519-sha512
+.It
 sntrup761x25519-sha512@openssh.com
 .El
 .Pp
 The default is:
 .Bd -literal -offset indent
-sntrup761x25519-sha512@openssh.com,
+sntrup761x25519-sha512,sntrup761x25519-sha512@openssh.com,
+mlkem768x25519-sha256,
 curve25519-sha256,curve25519-sha256@libssh.org,
 ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,
 diffie-hellman-group-exchange-sha256,
@@ -1005,7 +1087,7 @@ diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,
 diffie-hellman-group14-sha256
 .Ed
 .Pp
-The list of available key exchange algorithms may also be obtained using
+The list of supported key exchange algorithms may also be obtained using
 .Qq ssh -Q KexAlgorithms .
 .It Cm ListenAddress
 Specifies the local addresses
@@ -1073,9 +1155,10 @@ DEBUG and DEBUG1 are equivalent.
 DEBUG2 and DEBUG3 each specify higher levels of debugging output.
 Logging with a DEBUG level violates the privacy of users and is not recommended.
 .It Cm LogVerbose
-Specify one or more overrides to LogLevel.
-An override consists of a pattern lists that matches the source file, function
-and line number to force detailed logging for.
+Specify one or more overrides to
+.Cm LogLevel .
+An override consists of one or more pattern lists that matches the
+source file, function and line number to force detailed logging for.
 For example, an override pattern of:
 .Bd -literal -offset indent
 kex.c:*:1000,*:kex_exchange_identification():*,packet.c:*
@@ -1173,9 +1256,11 @@ applied.
 .Pp
 The arguments to
 .Cm Match
-are one or more criteria-pattern pairs or the single token
-.Cm All
-which matches all criteria.
+are one or more criteria-pattern pairs or one of the single token criteria:
+.Cm All ,
+which matches all criteria, or
+.Cm Invalid-User ,
+which matches when the requested user-name does not match any known account.
 The available criteria are
 .Cm User ,
 .Cm Group ,
@@ -1226,6 +1311,7 @@ Available keywords are
 .Cm AuthorizedPrincipalsFile ,
 .Cm Banner ,
 .Cm CASignatureAlgorithms ,
+.Cm ChannelTimeout ,
 .Cm ChrootDirectory ,
 .Cm ClientAliveCountMax ,
 .Cm ClientAliveInterval ,
@@ -1247,6 +1333,7 @@ Available keywords are
 .Cm LogLevel ,
 .Cm MaxAuthTries ,
 .Cm MaxSessions ,
+.Cm PAMServiceName ,
 .Cm PasswordAuthentication ,
 .Cm PermitEmptyPasswords ,
 .Cm PermitListen ,
@@ -1258,6 +1345,7 @@ Available keywords are
 .Cm PubkeyAcceptedAlgorithms ,
 .Cm PubkeyAuthentication ,
 .Cm PubkeyAuthOptions ,
+.Cm RefuseConnection ,
 .Cm RekeyLimit ,
 .Cm RevokedKeys ,
 .Cm RDomain ,
@@ -1265,6 +1353,7 @@ Available keywords are
 .Cm StreamLocalBindMask ,
 .Cm StreamLocalBindUnlink ,
 .Cm TrustedUserCAKeys ,
+.Cm UnusedConnectionTimeout ,
 .Cm X11DisplayOffset ,
 .Cm X11Forwarding
 and
@@ -1325,6 +1414,13 @@ with caution as it, unlike just using NoneEnabled, doesn't provide data integrit
 protection against man-in-the-middle attacks. As with NoneEnabled all authentication
 remains encrypted and integrity is ensured. Default is 
 .Cm no.
+.It Cm PAMServiceName
+Specifies the service name used for Pluggable Authentication Modules (PAM)
+authentication, authorisation and session controls when
+.Cm UsePAM
+is enabled.
+The default is
+.Cm sshd .
 .It Cm PasswordAuthentication
 Specifies whether password authentication is allowed.
 The default is
@@ -1514,6 +1610,91 @@ Values for IPv4 and optionally IPv6 may be specified, separated by a colon.
 The default is
 .Cm 32:128 ,
 which means each address is considered individually.
+.It Cm PerSourcePenalties
+Controls penalties for various conditions that may represent attacks on
+.Xr sshd 8 .
+If a penalty is enforced against a client then its source address and any
+others in the same network, as defined by
+.Cm PerSourceNetBlockSize ,
+will be refused connection for a period.
+.Pp
+A penalty doesn't affect concurrent connections in progress, but multiple
+penalties from the same source from concurrent connections will accumulate
+up to a maximum.
+Conversely, penalties are not applied until a minimum threshold time has been
+accumulated.
+.Pp
+Penalties are enabled by default with the default settings listed below
+but may disabled using the
+.Cm no
+keyword.
+The defaults may be overridden by specifying one or more of the keywords below,
+separated by whitespace.
+All keywords accept arguments, e.g.\&
+.Qq crash:2m .
+.Bl -tag -width Ds
+.It Cm crash:duration
+Specifies how long to refuse clients that cause a crash of
+.Xr sshd 8 (default: 90s).
+.It Cm authfail:duration
+Specifies how long to refuse clients that disconnect after making one or more
+unsuccessful authentication attempts (default: 5s).
+.It Cm refuseconnection:duration
+Specifies how long to refuse clients that were administratively prohibited
+connection via the
+.Cm RefuseConnection
+option (default: 10s).
+.It Cm noauth:duration
+Specifies how long to refuse clients that disconnect without attempting
+authentication (default: 1s).
+This timeout should be used cautiously otherwise it may penalise legitimate
+scanning tools such as
+.Xr ssh-keyscan 1 .
+.It Cm grace-exceeded:duration
+Specifies how long to refuse clients that fail to authenticate after
+.Cm LoginGraceTime
+(default: 10s).
+.It Cm max:duration
+Specifies the maximum time a particular source address range will be refused
+access for (default: 10m).
+Repeated penalties will accumulate up to this maximum.
+.It Cm min:duration
+Specifies the minimum penalty that must accrue before enforcement begins
+(default: 15s).
+.It Cm max-sources4:number , max-sources6:number
+Specifies the maximum number of client IPv4 and IPv6 address ranges to
+track for penalties (default: 65536 for both).
+.It Cm overflow:mode
+Controls how the server behaves when
+.Cm max-sources4
+or
+.Cm max-sources6
+is exceeded.
+There are two operating modes:
+.Cm deny-all ,
+which denies all incoming connections other than those exempted via
+.Cm PerSourcePenaltyExemptList
+until a penalty expires, and
+.Cm permissive ,
+which allows new connections by removing existing penalties early
+(default: permissive).
+Note that client penalties below the
+.Cm min
+threshold count against the total number of tracked penalties.
+IPv4 and IPv6 addresses are tracked separately, so an overflow in one will
+not affect the other.
+.It Cm overflow6:mode
+Allows specifying a different overflow mode for IPv6 addresses.
+The default it to use the same overflow mode as was specified for IPv4.
+.El
+.It Cm PerSourcePenaltyExemptList
+Specifies a comma-separated list of addresses to exempt from penalties.
+This list may contain wildcards and CIDR address/masklen ranges.
+Note that the mask length provided must be consistent with the address -
+it is an error to specify a mask length that is too long for the address
+or one with bits set in this host portion of the address.
+For example, 192.0.2.0/33 and 192.0.2.0/8, respectively.
+The default is not to exempt any addresses.
 .It Cm PidFile
 Specifies the file that contains the process ID of the
 SSH daemon, or
@@ -1620,10 +1801,22 @@ options have any effect for other, non-FIDO, public key types.
 Specifies whether public key authentication is allowed.
 The default is
 .Cm yes .
+.It Cm RefuseConnection
+Indicates that
+.Xr sshd 8
+should unconditionally terminate the connection.
+Additionally, a
+.Cm refuseconnection
+penalty may be recorded against the source of the connection if
+.Cm PerSourcePenalties
+are enabled.
+This option is only really useful in a
+.Cm Match
+block.
 .It Cm RekeyLimit
-Specifies the maximum amount of data that may be transmitted before the
-session key is renegotiated, optionally followed by a maximum amount of
-time that may pass before the session key is renegotiated.
+Specifies the maximum amount of data that may be transmitted or received
+before the session key is renegotiated, optionally followed by a maximum
+amount of time that may pass before the session key is renegotiated.
 The first argument is specified in bytes and may have a suffix of
 .Sq K ,
 .Sq M ,
@@ -1645,6 +1838,16 @@ is
 .Cm default none ,
 which means that rekeying is performed after the cipher's default amount
 of data has been sent or received and no time based rekeying is done.
+.It Cm RequiredRSASize
+Specifies the minimum RSA key size (in bits) that
+.Xr sshd 8
+will accept.
+User and host-based authentication keys smaller than this limit will be
+refused.
+The default is
+.Cm 1024
+bits.
+Note that this limit may only be raised from the default.
 .It Cm RevokedKeys
 Specifies revoked public keys file, or
 .Cm none
@@ -1685,6 +1888,13 @@ via
 .Cm AcceptEnv
 or
 .Cm PermitUserEnvironment .
+.It Cm SshdSessionPath
+Overrides the default path to the
+.Cm sshd-session
+binary that is invoked to handle each connection.
+The default is
+.Pa /usr/libexec/sshd-session .
+This option is intended for use by tests.
 .It Cm StreamLocalBindMask
 Sets the octal file creation mode mask
 .Pq umask
@@ -1739,6 +1949,14 @@ implements an in-process SFTP server.
 This may simplify configurations using
 .Cm ChrootDirectory
 to force a different filesystem root on clients.
+It accepts the same command line arguments as
+.Cm sftp-server
+and even though it is in-process, settings such as
+.Cm LogLevel
+or
+.Cm SyslogFacility
+do not apply to it and must be set explicitly via
+command line arguments.
 .Pp
 By default no subsystems are defined.
 .It Cm SyslogFacility
@@ -1768,14 +1986,6 @@ This avoids infinitely hanging sessions.
 .Pp
 To disable TCP keepalive messages, the value should be set to
 .Cm no .
-.It Cm TcpRcvBuf
-Set the TCP socket receive buffer to n Kilobytes. It can be set up to the
-maximum socket size allowed by the system. This is useful in situations where
-the tcp receive window is set low but the maximum buffer size is set
-higher (as is typical). This works on a per TCP connection basis. You can also
-use this to artifically limit the transfer rate of the connection. In these
-cases the throughput will be no more than n/RTT KB/s. The minimum buffer size is 1KB.
-Default is the current system wide tcp receive buffer size.
 .IT Cm TcpRcvBufPoll
 Enable of disable the polling of the tcp receive buffer throughout the life
 of the connection. Make sure that this option is enabled for systems making 
@@ -1799,6 +2009,33 @@ for authentication using
 .Cm TrustedUserCAKeys .
 For more details on certificates, see the CERTIFICATES section in
 .Xr ssh-keygen 1 .
+.It Cm UnusedConnectionTimeout
+Specifies whether and how quickly
+.Xr sshd 8
+should close client connections with no open channels.
+Open channels include active shell, command execution or subsystem
+sessions, connected network, socket, agent or X11 forwardings.
+Forwarding listeners, such as those from the
+.Xr ssh 1
+.Fl R
+flag, are not considered as open channels and do not prevent the timeout.
+The timeout value
+is specified in seconds or may use any of the units documented in the
+.Sx TIME FORMATS
+section.
+.Pp
+Note that this timeout starts when the client connection completes
+user authentication but before the client has an opportunity to open any
+channels.
+Caution should be used when using short timeout values, as they may not
+provide sufficient time for the client to request and open its channels
+before terminating the connection.
+.Pp
+The default
+.Cm none
+is to never expire connections for having no open channels.
+This option may be useful in conjunction with
+.Cm ChannelTimeout .
 .It Cm UseDNS
 Specifies whether
 .Xr sshd 8
@@ -1965,6 +2202,10 @@ which are expanded at runtime:
 .It %%
 A literal
 .Sq % .
+.It \&%C
+Identifies the connection endpoints, containing
+four space-separated values: client address, client port number,
+server address, and server port number.
 .It \&%D
 The routing domain in which the incoming connection was received.
 .It %F
@@ -1992,13 +2233,13 @@ The username.
 .El
 .Pp
 .Cm AuthorizedKeysCommand
-accepts the tokens %%, %f, %h, %k, %t, %U, and %u.
+accepts the tokens %%, %C, %D, %f, %h, %k, %t, %U, and %u.
 .Pp
 .Cm AuthorizedKeysFile
 accepts the tokens %%, %h, %U, and %u.
 .Pp
 .Cm AuthorizedPrincipalsCommand
-accepts the tokens %%, %F, %f, %h, %i, %K, %k, %s, %T, %t, %U, and %u.
+accepts the tokens %%, %C, %D, %F, %f, %h, %i, %K, %k, %s, %T, %t, %U, and %u.
 .Pp
 .Cm AuthorizedPrincipalsFile
 accepts the tokens %%, %h, %U, and %u.

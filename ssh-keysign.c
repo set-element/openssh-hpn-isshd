@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-keysign.c,v 1.70 2022/01/06 22:00:18 djm Exp $ */
+/* $OpenBSD: ssh-keysign.c,v 1.74 2024/04/30 05:53:03 djm Exp $ */
 /*
  * Copyright (c) 2002 Markus Friedl.  All rights reserved.
  *
@@ -155,9 +155,7 @@ valid_request(struct passwd *pw, char *host, struct sshkey **ret, char **pkalgp,
 
 	debug3_f("fail %d", fail);
 
-	if (fail)
-		sshkey_free(key);
-	else {
+	if (!fail) {
 		if (ret != NULL) {
 			*ret = key;
 			key = NULL;
@@ -197,9 +195,14 @@ main(int argc, char **argv)
 	if (fd > 2)
 		close(fd);
 
+	for (i = 0; i < NUM_KEYTYPES; i++)
+		key_fd[i] = -1;
+
 	i = 0;
 	/* XXX This really needs to read sshd_config for the paths */
+#ifdef WITH_DSA
 	key_fd[i++] = open(_PATH_HOST_DSA_KEY_FILE, O_RDONLY);
+#endif
 	key_fd[i++] = open(_PATH_HOST_ECDSA_KEY_FILE, O_RDONLY);
 	key_fd[i++] = open(_PATH_HOST_ED25519_KEY_FILE, O_RDONLY);
 	key_fd[i++] = open(_PATH_HOST_XMSS_KEY_FILE, O_RDONLY);
@@ -265,7 +268,7 @@ main(int argc, char **argv)
 		    __progname, rver, version);
 	if ((r = sshbuf_get_u32(b, (u_int *)&fd)) != 0)
 		fatal_r(r, "%s: buffer error", __progname);
-	if (fd < 0 || fd == STDIN_FILENO || fd == STDOUT_FILENO)
+	if (fd <= STDERR_FILENO)
 		fatal("%s: bad fd = %d", __progname, fd);
 	if ((host = get_local_name(fd)) == NULL)
 		fatal("%s: cannot get local name for fd", __progname);

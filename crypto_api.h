@@ -1,4 +1,4 @@
-/* $OpenBSD: crypto_api.h,v 1.7 2021/01/08 02:33:13 dtucker Exp $ */
+/* $OpenBSD: crypto_api.h,v 1.9 2024/09/02 12:13:56 djm Exp $ */
 
 /*
  * Assembled from generated headers and source files by Markus Friedl.
@@ -32,8 +32,6 @@ typedef uint64_t crypto_uint64;
 int	crypto_hash_sha512(unsigned char *, const unsigned char *,
     unsigned long long);
 
-int	crypto_verify_32(const unsigned char *, const unsigned char *);
-
 #define crypto_sign_ed25519_SECRETKEYBYTES 64U
 #define crypto_sign_ed25519_PUBLICKEYBYTES 32U
 #define crypto_sign_ed25519_BYTES 64U
@@ -54,5 +52,10 @@ int	crypto_kem_sntrup761_enc(unsigned char *cstr, unsigned char *k,
 int	crypto_kem_sntrup761_dec(unsigned char *k,
     const unsigned char *cstr, const unsigned char *sk);
 int	crypto_kem_sntrup761_keypair(unsigned char *pk, unsigned char *sk);
+
+#define crypto_kem_mlkem768_PUBLICKEYBYTES 1184
+#define crypto_kem_mlkem768_SECRETKEYBYTES 2400
+#define crypto_kem_mlkem768_CIPHERTEXTBYTES 1088
+#define crypto_kem_mlkem768_BYTES 32
 
 #endif /* crypto_api_h */

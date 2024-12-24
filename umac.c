@@ -1,4 +1,4 @@
-/* $OpenBSD: umac.c,v 1.22 2022/01/01 05:55:06 jsg Exp $ */
+/* $OpenBSD: umac.c,v 1.23 2023/03/07 01:30:52 djm Exp $ */
 /* -----------------------------------------------------------------------
  *
  * umac.c -- C Implementation UMAC Message Authentication
@@ -154,7 +154,7 @@ u_int32_t umac_get_u32_le(const void *vp)
         return (v);
 }
 
-#if (! __LITTLE_ENDIAN__) /* compile time warning thrown otherwise */
+#if 0 /* compile time warning thrown otherwise */
 static __attribute__((__bounded__(__minbytes__, 1, 4)));
 void umac_put_u32_le(void *vp, u_int32_t v)
 {
@@ -266,7 +266,8 @@ static void pdf_init(pdf_ctx *pc, aes_int_key prf_key)
     explicit_bzero(buf, sizeof(buf));
 }
 
-static void pdf_gen_xor(pdf_ctx *pc, const UINT8 nonce[8], UINT8 buf[8])
+static void pdf_gen_xor(pdf_ctx *pc, const UINT8 nonce[8],
+    UINT8 buf[UMAC_OUTPUT_LEN])
 {
     /* 'ndx' indicates that we'll be using the 0th or 1st eight bytes
      * of the AES output. If last time around we returned the ndx-1st
